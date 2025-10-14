@@ -25,12 +25,6 @@ A minimum task scheduling library for Go, built on top of cron expressions with 
 go get github.com/cymoo/mita
 ```
 
-## Dependencies
-
-```bash
-go get github.com/robfig/cron/v3
-```
-
 ## Quick Start
 
 ### Basic Usage
