@@ -500,19 +500,15 @@ func main() {
 ```go
 // Chi router
 r := chi.NewRouter()
-r.Mount("/tasks", tm.WebHandler("/tasks"))
-
-// Gorilla mux
-r := mux.NewRouter()
-r.PathPrefix("/tasks").Handler(tm.WebHandler("/tasks"))
+r.Mount("/", tm.WebHandler("/tasks"))
 
 // Gin
 router := gin.Default()
-router.Any("/tasks/*any", gin.WrapH(tm.WebHandler("/tasks")))
+router.Any("/*any", gin.WrapH(tm.WebHandler("/tasks")))
 
 // Echo
 e := echo.New()
-e.Any("/tasks/*", echo.WrapHandler(tm.WebHandler("/tasks")))
+e.Any("/*", echo.WrapHandler(tm.WebHandler("/tasks")))
 ```
 
 ## Complete Example
