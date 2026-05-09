@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mita</title>
+  <link rel="stylesheet" href="{{.StylesURL}}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="wordmark">mita</span>
+      <span id="health" class="health-badge">connecting…</span>
+    </div>
+    <nav class="tab-nav" role="tablist">
+      <button class="tab active" data-tab="tasks" role="tab">Tasks</button>
+      <button class="tab" data-tab="stats" role="tab">Stats</button>
+    </nav>
+  </header>
+
+  <main class="container">
+
+    <section id="view-tasks" class="view" role="tabpanel">
+      <div class="toolbar">
+        <div id="summary" class="summary"></div>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th class="col-status">Status</th>
+              <th>Task</th>
+              <th>Schedule</th>
+              <th>Last Run</th>
+              <th>Next Run</th>
+              <th>Runs</th>
+              <th>Errors</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="task-tbody"></tbody>
+        </table>
+        <div id="tasks-empty" class="empty hidden">
+          No tasks registered. Add tasks via <code>tm.AddTask()</code>.
+        </div>
+      </div>
+    </section>
+
+    <section id="view-stats" class="view hidden" role="tabpanel">
+      <div id="stats-cards" class="stats-grid"></div>
+      <div class="tbl-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Task</th>
+              <th class="col-status">Status</th>
+              <th>Runs</th>
+              <th>Errors</th>
+              <th>Success Rate</th>
+              <th>Last Run</th>
+              <th>Next Run</th>
+            </tr>
+          </thead>
+          <tbody id="stats-tbody"></tbody>
+        </table>
+        <div id="stats-empty" class="empty hidden">
+          No tasks registered yet.
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+
+  <script>
+  (function () {
+    'use strict';
+
+    const API    = "{{.APIURL}}";
+    const ACTION = "{{.ActionURL}}";
+    const INIT   = "{{.InitialTab}}";
+
+    let currentTab = INIT || 'tasks';
+
+    // ── Tab switching ────────────────────────────────────────────────
+    function setTab(name) {
+      currentTab = name;
+      document.querySelectorAll('[data-tab]').forEach(function (el) {
+        el.classList.toggle('active', el.dataset.tab === name);
+      });
+      document.querySelectorAll('.view').forEach(function (el) {
+        el.classList.toggle('hidden', el.id !== 'view-' + name);
+      });
+    }
+
+    document.querySelectorAll('button[data-tab]').forEach(function (btn) {
+      btn.addEventListener('click', function () { setTab(btn.dataset.tab); });
+    });
+
+    // ── Polling ──────────────────────────────────────────────────────
+    async function poll() {
+      try {
+        var res = await fetch(API, { cache: 'no-store' });
+        if (!res.ok) throw new Error(res.status);
+        var data = await res.json();
+        render(data);
+      } catch (_) {
+        setHealth('offline', 'offline');
+      }
+    }
+
+    // ── Rendering ────────────────────────────────────────────────────
+    function render(data) {
+      renderHealth(data.stats);
+      renderSummary(data.stats);
+      renderTaskTable(data.tasks);
+      renderStatsCards(data.stats);
+      renderStatsTable(data.tasks);
+    }
+
+    function renderHealth(s) {
+      var er = s.total_runs > 0 ? s.total_errors / s.total_runs : 0;
+      if (er >= 0.25)              setHealth('critical', 'critical');
+      else if (s.total_errors > 0) setHealth('degraded', 'degraded');
+      else if (s.running_tasks > 0) setHealth(s.running_tasks + ' running', 'running');
+      else                          setHealth('nominal', 'nominal');
+    }
+
+    function setHealth(label, cls) {
+      var el = document.getElementById('health');
+      el.textContent = label;
+      el.className = 'health-badge ' + cls;
+    }
+
+    function renderSummary(s) {
+      var pills = [
+        { v: s.total_tasks,   l: 'total',   c: '' },
+        { v: s.running_tasks, l: 'running', c: s.running_tasks > 0 ? 'blue'  : '' },
+        { v: s.total_errors,  l: 'errors',  c: s.total_errors  > 0 ? 'red'   : '' },
+        { v: s.total_runs,    l: 'runs',    c: '' },
+      ];
+      document.getElementById('summary').innerHTML = pills.map(function (p) {
+        return '<span class="pill ' + p.c + '"><b>' + p.v + '</b> ' + p.l + '</span>';
+      }).join('');
+    }
+
+    function renderTaskTable(tasks) {
+      var tbody = document.getElementById('task-tbody');
+      var empty = document.getElementById('tasks-empty');
+      if (!tasks || !tasks.length) {
+        tbody.innerHTML = '';
+        empty.classList.remove('hidden');
+        return;
+      }
+      empty.classList.add('hidden');
+      tbody.innerHTML = tasks.map(taskRow).join('');
+    }
+
+    function taskRow(t) {
+      var sc = t.running ? 'running' : t.enabled ? 'enabled' : 'disabled';
+      var sl = t.running ? 'Running' : t.enabled ? 'Active'  : 'Paused';
+      var toggleAction = t.enabled ? 'disable' : 'enable';
+      var toggleLabel  = t.enabled ? 'Pause'   : 'Resume';
+      return [
+        '<tr data-name="' + e(t.name) + '" class="row-' + sc + '">',
+        '<td class="col-status"><span class="dot dot-' + sc + '"></span><span class="status-text">' + sl + '</span></td>',
+        '<td class="td-name"><span class="task-name">' + e(t.name) + '</span>' +
+          (t.last_error ? '<span class="err-flag" title="' + e(t.last_error) + '" data-error="' + e(t.last_error) + '">!</span>' : '') + '</td>',
+        '<td><code>' + e(t.schedule) + '</code></td>',
+        '<td>' + relTime(t.last_run) + '</td>',
+        '<td>' + (t.enabled && !t.running ? relTime(t.next_run) : '—') + '</td>',
+        '<td>' + t.run_count + '</td>',
+        '<td class="' + (t.error_count > 0 ? 'col-error' : '') + '">' + t.error_count + '</td>',
+        '<td><div class="actions">',
+        '<button class="btn-act btn-run" data-action="run"' + (t.running ? ' disabled' : '') + '>Run</button>',
+        '<button class="btn-act btn-tog" data-action="' + toggleAction + '">' + toggleLabel + '</button>',
+        '<button class="btn-act btn-del" data-action="remove">✕</button>',
+        '</div></td>',
+        '</tr>',
+      ].join('');
+    }
+
+    function renderStatsCards(s) {
+      var sr = s.total_runs > 0
+        ? ((s.total_runs - s.total_errors) / s.total_runs * 100).toFixed(1) + '%'
+        : '—';
+      var cards = [
+        { l: 'Total Tasks',      v: s.total_tasks,       c: '' },
+        { l: 'Enabled',          v: s.enabled_tasks,     c: '' },
+        { l: 'Running',          v: s.running_tasks,     c: s.running_tasks > 0 ? 'blue' : '' },
+        { l: 'Total Runs',       v: s.total_runs,        c: '' },
+        { l: 'Errors',           v: s.total_errors,      c: s.total_errors > 0 ? 'red' : '' },
+        { l: 'Success Rate',     v: sr,                  c: '' },
+        { l: 'Max Concurrent',   v: s.max_concurrent || '∞', c: '' },
+        { l: 'Overlap',          v: s.allow_overlapping ? 'allowed' : 'prevented', c: '' },
+      ];
+      document.getElementById('stats-cards').innerHTML = cards.map(function (c) {
+        return '<div class="stat-card"><div class="stat-label">' + c.l +
+          '</div><div class="stat-value ' + c.c + '">' + c.v + '</div></div>';
+      }).join('');
+    }
+
+    function renderStatsTable(tasks) {
+      var tbody = document.getElementById('stats-tbody');
+      var empty = document.getElementById('stats-empty');
+      if (!tasks || !tasks.length) {
+        tbody.innerHTML = '';
+        empty.classList.remove('hidden');
+        return;
+      }
+      empty.classList.add('hidden');
+      var sorted = tasks.slice().sort(function (a, b) {
+        return b.error_count !== a.error_count
+          ? b.error_count - a.error_count
+          : a.name.localeCompare(b.name);
+      });
+      tbody.innerHTML = sorted.map(function (t) {
+        var sc  = t.running ? 'running' : t.enabled ? 'enabled' : 'disabled';
+        var sl  = t.running ? 'Running' : t.enabled ? 'Active'  : 'Paused';
+        var pct = t.run_count > 0 ? (t.run_count - t.error_count) / t.run_count * 100 : 100;
+        var srLabel = t.run_count > 0 ? pct.toFixed(1) + '%' : '—';
+        return [
+          '<tr>',
+          '<td><span class="task-name">' + e(t.name) + '</span><br><code>' + e(t.schedule) + '</code></td>',
+          '<td class="col-status"><span class="dot dot-' + sc + '"></span>' + sl + '</td>',
+          '<td>' + t.run_count + '</td>',
+          '<td class="' + (t.error_count > 0 ? 'col-error' : '') + '">' + t.error_count + '</td>',
+          '<td><div class="rate-bar"><div class="rate-fill" style="width:' + pct.toFixed(1) + '%"></div></div>' +
+            '<small>' + srLabel + '</small></td>',
+          '<td>' + relTime(t.last_run) + '</td>',
+          '<td>' + (t.enabled && !t.running ? relTime(t.next_run) : '—') + '</td>',
+          '</tr>',
+        ].join('');
+      }).join('');
+    }
+
+    // ── Actions (event delegation) ───────────────────────────────────
+    document.addEventListener('click', async function (evt) {
+      var flag = evt.target.closest('.err-flag');
+      if (flag) {
+        var msg = flag.dataset.error;
+        if (msg) toast(msg, 'error', 8000);
+        return;
+      }
+
+      var btn = evt.target.closest('button[data-action]');
+      if (!btn || btn.disabled) return;
+      var row = btn.closest('tr[data-name]');
+      if (!row) return;
+
+      var name   = row.dataset.name;
+      var action = btn.dataset.action;
+
+      if (action === 'remove' && !confirm('Remove task "' + name + '"?')) return;
+
+      btn.disabled = true;
+      var body = new URLSearchParams({ name: name, action: action });
+      try {
+        var res  = await fetch(ACTION, { method: 'POST', body: body });
+        var data = await res.json();
+        if (data.ok) {
+          var labels = { run: 'queued', enable: 'resumed', disable: 'paused', remove: 'removed' };
+          toast('"' + name + '" ' + (labels[action] || action), 'success');
+          await poll();
+        } else {
+          toast(data.error || 'Action failed', 'error');
+          btn.disabled = false;
+        }
+      } catch (_) {
+        toast('Network error', 'error');
+        btn.disabled = false;
+      }
+    });
+
+    // ── Toast ────────────────────────────────────────────────────────
+    function toast(msg, type, dur) {
+      var zone = document.getElementById('toasts');
+      var el   = document.createElement('div');
+      el.className  = 'toast toast-' + (type || 'info');
+      el.textContent = msg;
+      zone.appendChild(el);
+      setTimeout(function () { el.classList.add('show'); }, 10);
+      setTimeout(function () {
+        el.classList.remove('show');
+        setTimeout(function () { el.remove(); }, 300);
+      }, dur || 3500);
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────
+    function e(s) {
+      return String(s).replace(/[&<>"]/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+      });
+    }
+
+    function relTime(iso) {
+      if (!iso) return '—';
+      var d = new Date(iso);
+      if (d.getFullYear() < 100) return '—';
+      var diff = d - Date.now();
+      var abs  = Math.abs(diff);
+      var past = diff < 0;
+      var pre  = past ? '' : 'in ';
+      var suf  = past ? ' ago' : '';
+      if (abs < 1000)     return 'now';
+      if (abs < 60000)    return pre + Math.floor(abs / 1000)    + 's' + suf;
+      if (abs < 3600000)  return pre + Math.floor(abs / 60000)   + 'm' + suf;
+      if (abs < 86400000) return pre + Math.floor(abs / 3600000) + 'h' + suf;
+      return pre + Math.floor(abs / 86400000) + 'd' + suf;
+    }
+
+    // ── Boot ─────────────────────────────────────────────────────────
+    setTab(currentTab);
+    poll();
+    setInterval(poll, 2000);
+  })();
+  </script>
+</body>
+</html>

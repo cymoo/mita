@@ -142,11 +142,6 @@ func main() {
 	// Create web handler mounted at /
 	mux := tm.WebHandler("/tasks")
 
-	// Start HTTP server
-	log.Printf("server starting on http://localhost:8080/tasks")
-	fmt.Println(strings.Repeat("=", 70))
-	http.ListenAndServe("localhost:8080", mux)
-
 	// Manually trigger sync task after 3 seconds
 	go func() {
 		time.Sleep(3 * time.Second)
@@ -195,13 +190,20 @@ func main() {
 			displayStats(tm)
 		}
 	}()
+
+	// Start HTTP server
+	log.Printf("server starting on http://localhost:8080/tasks")
+	fmt.Println(strings.Repeat("=", 70))
+	if err := http.ListenAndServe("localhost:8080", mux); err != nil {
+		log.Fatalf("server failed: %v", err)
+	}
 }
 
 // displayStats shows current task manager statistics
 func displayStats(tm *mita.TaskManager) {
-	fmt.Println("\n" + string(make([]byte, 70)))
+	fmt.Println("\n" + strings.Repeat("=", 70))
 	fmt.Println("TASK MANAGER STATISTICS")
-	fmt.Println(string(make([]byte, 70)))
+	fmt.Println(strings.Repeat("=", 70))
 
 	stats := tm.GetStats()
 	fmt.Printf("Total Tasks:       %v\n", stats["total_tasks"])
@@ -213,7 +215,7 @@ func displayStats(tm *mita.TaskManager) {
 	fmt.Printf("Allow Overlapping: %v\n", stats["allow_overlapping"])
 
 	fmt.Println("\nPER-TASK DETAILS")
-	fmt.Println(string(make([]byte, 70)))
+	fmt.Println(strings.Repeat("=", 70))
 
 	tasks := tm.ListTasks()
 	for _, task := range tasks {
@@ -242,5 +244,5 @@ func displayStats(tm *mita.TaskManager) {
 		}
 	}
 
-	fmt.Println("\n" + string(make([]byte, 70)) + "\n")
+	fmt.Println("\n" + strings.Repeat("=", 70) + "\n")
 }
