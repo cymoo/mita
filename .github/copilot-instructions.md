@@ -21,19 +21,33 @@ go run _examples/main.go
 
 ## Architecture
 
-`mita` is a single-package Go library (`package mita`) for scheduled task management. All public API lives in two files:
+`mita` is a small Go module (`github.com/cymoo/mita`) for scheduled task management. Public scheduler APIs live in the root `mita` package:
 
-- **`mita.go`** — Core: `TaskManager`, `TaskInfo`, `Schedule` interface, `ScheduleBuilder` (fluent API), `CronSchedule` (raw expressions), all lifecycle and concurrency logic.
-- **`web.go` + `ui/`** — HTTP web UI mounted via `tm.WebHandler(baseURL)`. `web.go` owns routing/data/actions; `ui/*.html` and `ui/*.css` are embedded with `go:embed`.
+- **`mita.go`** — Core: `TaskManager`, `TaskInfo`, lifecycle hooks, context injection, execution/concurrency logic.
+- **`schedule.go`** — `Schedule` interface, `ScheduleBuilder` fluent API, and `CronSchedule` raw expressions.
+- **`web.go` + `ui/`** — `web.go` is a thin root-package adapter for `tm.WebHandler(baseURL)`. The `ui` subpackage owns HTTP routing/data/actions and embeds `ui/index.html` and `ui/styles.css` with `go:embed`.
 
 The only external dependency is `github.com/robfig/cron/v3`, used as the underlying cron engine.
 
-**Lifecycle:** `New(opts...)` creates the manager → `AddTask(...)` registers tasks → `Start()` begins scheduling → `Stop()` gracefully shuts down (30 s timeout).
+**Lifecycle:** `New(opts...)` creates the manager → `AddTask(...)` registers tasks → `Start()` begins cron scheduling → `Stop()` gracefully shuts down (30 s timeout). `AddTask` can be called before or after `Start()`, but `Stop()` is terminal.
+
+**`IsRunning()`** returns `true` only after `Start()` and before `Stop()`. `Start()` and `Stop()` are idempotent; `Start()` after `Stop()` does not restart the manager.
 
 **Concurrency model:**
 - A `sync.RWMutex` guards all reads/writes to `tasks` map and `TaskInfo` fields. Read operations use `RLock`; mutations use `Lock`.
 - Optional global concurrency cap uses a channel-based semaphore (`chan struct{}`).
-- Per-task overlap prevention is checked via `TaskInfo.Running` under the write lock.
+- Per-task overlap prevention is checked via `TaskInfo.RunningCount` under the write lock. `TaskInfo.Running` is derived from `RunningCount > 0`.
+- When the global concurrency cap is full, scheduled executions are skipped and manual runs return `ErrMaxConcurrencyReached`; there is no hidden queue.
+
+**Web UI routes** (all mounted under the `baseURL` prefix):
+
+| Route | Handler |
+|---|---|
+| `GET /` | Task list page |
+| `GET /stats` | Aggregated stats page |
+| `POST /action` | Enable/disable/run/remove a task |
+| `GET /api` | JSON task data (used by the list page) |
+| `GET /assets/styles.css` | Embedded CSS |
 
 ## Key Conventions
 
@@ -45,15 +59,19 @@ This differs from standard 5-field cron. `Every()` and `Cron()` both produce thi
 
 **`ScheduleBuilder` panics (not errors) on invalid builder inputs** (e.g., non-positive interval, hour out of 0–23). Raw `Cron(...)` expressions are validated when `AddTask` calls into `robfig/cron`.
 
-**Context value keys use `CtxtKey` (a typed `string`):**
+**Context value keys use `CtxtKey` internally; prefer `ContextValue` for retrieval:**
 ```go
 // Injecting
 mita.WithContextValue("db", dbConn)
 
 // Retrieving inside a task
-db := ctx.Value(mita.CtxtKey("db")).(*sql.DB)
+db := mita.ContextValue(ctx, "db").(*sql.DB)
 ```
 The task name is stored under a private `taskNameKey`; retrieve it with `mita.GetTaskName(ctx)`.
+
+**Lifecycle hooks are global manager options:** `WithOnTaskStart` and `WithOnTaskComplete` are synchronous observability hooks. Hook panics are recovered and logged; task panics are recovered, recorded as failures, and surfaced as `TaskCompleteEvent.Error`.
+
+**Manual execution has async and blocking forms:** `RunTaskNow(name)` submits and returns after admission; `RunTaskNowAndWait(ctx, name)` blocks until completion and returns the task error. The blocking form uses `ctx` for cancellation/deadline only; context values still come from `WithContextValue` / `WithContextInjector`.
 
 **`contextInjector` runs after static values are applied** and must not hold any locks (it is called outside the mutex). Static values are snapshot-copied before injection to avoid holding the lock during context building.
 

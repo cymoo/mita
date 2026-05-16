@@ -159,7 +159,8 @@
 
     function taskRow(t) {
       var sc = t.running ? 'running' : t.enabled ? 'enabled' : 'disabled';
-      var sl = t.running ? 'Running' : t.enabled ? 'Active'  : 'Paused';
+      var rc = t.running_count || (t.running ? 1 : 0);
+      var sl = t.running ? (rc > 1 ? 'Running (' + rc + ')' : 'Running') : t.enabled ? 'Active'  : 'Paused';
       var toggleAction = t.enabled ? 'disable' : 'enable';
       var toggleLabel  = t.enabled ? 'Pause'   : 'Resume';
       return [
@@ -217,7 +218,8 @@
       });
       tbody.innerHTML = sorted.map(function (t) {
         var sc  = t.running ? 'running' : t.enabled ? 'enabled' : 'disabled';
-        var sl  = t.running ? 'Running' : t.enabled ? 'Active'  : 'Paused';
+        var rc  = t.running_count || (t.running ? 1 : 0);
+        var sl  = t.running ? (rc > 1 ? 'Running (' + rc + ')' : 'Running') : t.enabled ? 'Active'  : 'Paused';
         var pct = t.run_count > 0 ? (t.run_count - t.error_count) / t.run_count * 100 : 100;
         var srLabel = t.run_count > 0 ? pct.toFixed(1) + '%' : '—';
         return [

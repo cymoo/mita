@@ -26,7 +26,7 @@ func main() {
 	tm := mita.New(
 		mita.WithLogger(logger),
 		mita.WithLocation(location),
-		mita.WithMaxConcurrent(3),        // Max 3 concurrent tasks
+		mita.WithMaxConcurrent(3),        // Max 3 concurrent running tasks
 		mita.WithAllowOverlapping(false), // Prevent overlapping executions
 		mita.WithContextValue("app", "demo"),
 		mita.WithContextInjector(func(ctx context.Context, taskName string) context.Context {
@@ -38,7 +38,7 @@ func main() {
 	// Example 1: Data cleanup task - runs every 5 seconds
 	err = tm.AddTask("cleanup", mita.Every().Seconds(5), func(ctx context.Context) error {
 		taskName := mita.GetTaskName(ctx)
-		app := ctx.Value("app")
+		app := mita.ContextValue(ctx, "app")
 		requestID := ctx.Value("request_id")
 
 		fmt.Printf("[%s] Starting data cleanup... (app=%v, request_id=%v)\n", taskName, app, requestID)

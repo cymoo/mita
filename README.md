@@ -12,6 +12,7 @@ A minimum task scheduling library for Go, built on top of cron expressions with 
 - 🚀 **Manual Triggers** - Execute tasks on-demand outside their regular schedule
 - 🎛️ **Task Management** - Full CRUD operations: enable, disable, remove tasks
 - 📝 **Logging** - Customizable logging output with detailed execution info
+- 🪝 **Lifecycle Hooks** - Observe task start and completion events
 - 🌍 **Timezone Support** - Configure task execution timezone
 - ⚡ **Second Precision** - Support for second-level scheduling granularity
 - 🛡️ **Thread-Safe** - Safe for concurrent use across multiple goroutines
@@ -67,9 +68,17 @@ func main() {
 tm := mita.New(
     mita.WithLogger(customLogger),           // Custom logger
     mita.WithLocation(location),             // Set timezone
-    mita.WithMaxConcurrent(5),               // Max concurrent tasks
+    mita.WithMaxConcurrent(5),               // Max concurrent running tasks
     mita.WithAllowOverlapping(false),        // Prevent overlapping
     mita.WithContextValue("env", "prod"),    // Inject context values
+    mita.WithOnTaskStart(func(e mita.TaskStartEvent) {
+        log.Printf("starting %s", e.TaskName)
+    }),
+    mita.WithOnTaskComplete(func(e mita.TaskCompleteEvent) {
+        if e.Error != nil {
+            log.Printf("%s failed: %v", e.TaskName, e.Error)
+        }
+    }),
 )
 ```
 
@@ -145,7 +154,9 @@ tm := mita.New(mita.WithLocation(location))
 
 ### WithMaxConcurrent
 
-Limit maximum concurrent tasks (0 = unlimited):
+Limit maximum concurrent running tasks (0 = unlimited). When the limit is reached,
+scheduled executions are skipped and manual executions return
+`ErrMaxConcurrencyReached`.
 
 ```go
 tm := mita.New(mita.WithMaxConcurrent(3))
@@ -190,6 +201,29 @@ tm := mita.New(
 )
 ```
 
+### WithOnTaskStart / WithOnTaskComplete
+
+Observe task lifecycle events:
+
+```go
+tm := mita.New(
+    mita.WithOnTaskStart(func(e mita.TaskStartEvent) {
+        log.Printf("START %s trigger=%s", e.TaskName, e.Trigger)
+    }),
+    mita.WithOnTaskComplete(func(e mita.TaskCompleteEvent) {
+        if e.Error != nil {
+            log.Printf("FAIL %s after %s: %v", e.TaskName, e.Duration, e.Error)
+            return
+        }
+        log.Printf("DONE %s after %s", e.TaskName, e.Duration)
+    }),
+)
+```
+
+Hooks are synchronous and observability-only. A hook panic is recovered and logged
+so it does not affect task execution. Task panics are recovered, recorded as
+failures, and surfaced through `TaskCompleteEvent.Error`.
+
 ## Task Management
 
 ### Adding Tasks
@@ -214,6 +248,26 @@ if err != nil {
     log.Printf("Manual trigger failed: %v", err)
 }
 ```
+
+`RunTaskNow` returns before the task finishes. It reports submission errors such
+as `ErrTaskDisabled`, `ErrTaskRunning`, `ErrMaxConcurrencyReached`, and
+`ErrTaskManagerStopped`; use `errors.Is` to check them.
+
+Use `RunTaskNowAndWait` when the caller should block until the task completes:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+if err := tm.RunTaskNowAndWait(ctx, "backup"); err != nil {
+    log.Printf("Manual run failed: %v", err)
+}
+```
+
+`RunTaskNowAndWait` uses the provided context for cancellation/deadline only; use
+`WithContextValue` or `WithContextInjector` for values available inside tasks.
+If the task is admitted and then the context is canceled, that execution counts
+toward `RunCount` and, when the task returns the context error, `ErrorCount`.
 
 ### Disabling Tasks
 
@@ -254,6 +308,7 @@ if err == nil {
     fmt.Printf("Next Run: %s\n", taskInfo.NextRun)
     fmt.Printf("Enabled: %v\n", taskInfo.Enabled)
     fmt.Printf("Running: %v\n", taskInfo.Running)
+    fmt.Printf("Running Count: %d\n", taskInfo.RunningCount)
 }
 ```
 
@@ -299,9 +354,9 @@ tm.AddTask("example", mita.Every().Minute(), func(ctx context.Context) error {
 ```go
 tm.AddTask("example", mita.Every().Minute(), func(ctx context.Context) error {
     // Get injected static context values
-    db := ctx.Value(mita.CtxtKey("database")).(*sql.DB)
-    requestID := ctx.Value(mita.CtxtKey("request_id")).(string)
-    env := ctx.Value(mita.CtxtKey("env")).(string)
+    db := mita.ContextValue(ctx, "database").(*sql.DB)
+    requestID := ctx.Value("request_id").(string)
+    env := mita.ContextValue(ctx, "env").(string)
     
     // Use injected values
     log.Printf("[%s] Processing in %s environment", requestID, env)
@@ -404,6 +459,10 @@ The `Stop()` method:
 2. Stops the cron scheduler
 3. Waits for all running tasks to complete (up to 30 seconds)
 4. Logs completion status
+
+`Start()` and `Stop()` are idempotent. `Stop()` is terminal: after it is called,
+the manager cannot be restarted and new tasks or manual executions are rejected
+with `ErrTaskManagerStopped`.
 
 ## Web Management Interface
 

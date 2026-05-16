@@ -2,6 +2,7 @@ package mita
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"maps"
@@ -23,20 +24,70 @@ const (
 // It should return an error if the task execution fails.
 type Task func(ctx context.Context) error
 
+// Public task manager errors. Use errors.Is to check wrapped errors returned by APIs.
+var (
+	ErrTaskNotFound          = errors.New("task not found")
+	ErrTaskDisabled          = errors.New("task disabled")
+	ErrTaskRunning           = errors.New("task already running")
+	ErrMaxConcurrencyReached = errors.New("max concurrency reached")
+	ErrTaskManagerStopped    = errors.New("task manager stopped")
+	ErrNilContext            = errors.New("nil context")
+)
+
+// TaskTrigger identifies how a task execution was triggered.
+type TaskTrigger string
+
+const (
+	TriggerScheduled TaskTrigger = "scheduled"
+	TriggerManual    TaskTrigger = "manual"
+)
+
+type managerState int
+
+const (
+	managerCreated managerState = iota
+	managerStarted
+	managerStopped
+)
+
+// TaskStartEvent is emitted immediately before a task function starts.
+type TaskStartEvent struct {
+	TaskName     string
+	Trigger      TaskTrigger
+	StartedAt    time.Time
+	Context      context.Context
+	RunCount     int64
+	RunningCount int
+}
+
+// TaskCompleteEvent is emitted after a task function finishes and internal state is updated.
+type TaskCompleteEvent struct {
+	TaskName     string
+	Trigger      TaskTrigger
+	StartedAt    time.Time
+	FinishedAt   time.Time
+	Duration     time.Duration
+	Error        error
+	RunCount     int64
+	ErrorCount   int64
+	RunningCount int
+}
+
 // TaskInfo holds metadata and statistics about a scheduled task.
 type TaskInfo struct {
-	Name       string       // Unique identifier for the task
-	Schedule   string       // Cron expression for the task schedule
-	Task       Task         // The actual task function to execute
-	EntryID    cron.EntryID // Cron entry ID for this task
-	AddedAt    time.Time    // When the task was added to the manager
-	LastRun    time.Time    // Last execution time
-	NextRun    time.Time    // Next scheduled execution time
-	RunCount   int64        // Total number of executions
-	ErrorCount int64        // Total number of failed executions
-	LastError  string       // Most recent error message (empty if last run succeeded)
-	Enabled    bool         // Whether the task is enabled for execution
-	Running    bool         // Whether the task is currently executing
+	Name         string       // Unique identifier for the task
+	Schedule     string       // Cron expression for the task schedule
+	Task         Task         // The actual task function to execute
+	EntryID      cron.EntryID // Cron entry ID for this task
+	AddedAt      time.Time    // When the task was added to the manager
+	LastRun      time.Time    // Last execution time
+	NextRun      time.Time    // Next scheduled execution time
+	RunCount     int64        // Total number of executions
+	ErrorCount   int64        // Total number of failed executions
+	LastError    string       // Most recent error message (empty if last run succeeded)
+	Enabled      bool         // Whether the task is enabled for execution
+	Running      bool         // Whether the task is currently executing
+	RunningCount int          // Number of currently executing instances
 }
 
 // TaskManager orchestrates scheduled task execution with concurrent control,
@@ -54,6 +105,19 @@ type TaskManager struct {
 	allowOverlapping bool                                                       // Whether same task can run concurrently
 	contextValues    map[string]any                                             // Static values to inject into task contexts
 	contextInjector  func(ctx context.Context, taskName string) context.Context // Dynamic context injection
+	onTaskStart      func(TaskStartEvent)                                       // Called before a task starts
+	onTaskComplete   func(TaskCompleteEvent)                                    // Called after a task completes
+	state            managerState                                               // Manager lifecycle state
+}
+
+type taskExecution struct {
+	name         string
+	trigger      TaskTrigger
+	task         Task
+	startedAt    time.Time
+	runCount     int64
+	runningCount int
+	acquiredSlot bool
 }
 
 // Option is a functional option for configuring TaskManager.
@@ -80,6 +144,7 @@ func WithLocation(loc *time.Location) Option {
 
 // WithMaxConcurrent sets the maximum number of tasks that can run concurrently.
 // A value of 0 means unlimited concurrency. Negative values are treated as 0.
+// When the limit is reached, scheduled executions are skipped and manual runs return ErrMaxConcurrencyReached.
 func WithMaxConcurrent(max int) Option {
 	return func(tm *TaskManager) {
 		if max < 0 {
@@ -121,6 +186,20 @@ func WithContextInjector(injector func(ctx context.Context, taskName string) con
 	}
 }
 
+// WithOnTaskStart sets a hook called immediately before each task execution starts.
+func WithOnTaskStart(hook func(TaskStartEvent)) Option {
+	return func(tm *TaskManager) {
+		tm.onTaskStart = hook
+	}
+}
+
+// WithOnTaskComplete sets a hook called after each task execution finishes.
+func WithOnTaskComplete(hook func(TaskCompleteEvent)) Option {
+	return func(tm *TaskManager) {
+		tm.onTaskComplete = hook
+	}
+}
+
 // New creates a new TaskManager with the given options.
 // The manager must be started with Start() before tasks will execute.
 func New(opts ...Option) *TaskManager {
@@ -159,13 +238,17 @@ func (tm *TaskManager) AddTask(name string, schedule Schedule, task Task) error 
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
+	if tm.state == managerStopped {
+		return fmt.Errorf("cannot add task %q: %w", name, ErrTaskManagerStopped)
+	}
+
 	// Check if task already exists
 	if _, exists := tm.tasks[name]; exists {
 		return fmt.Errorf("task '%s' already exists", name)
 	}
 
 	// Wrap task to add statistics and error handling
-	wrappedTask := tm.wrapTask(name, task)
+	wrappedTask := tm.wrapTask(name)
 
 	// Add to cron scheduler
 	entryID, err := tm.cron.AddFunc(schedule.String(), wrappedTask)
@@ -189,78 +272,219 @@ func (tm *TaskManager) AddTask(name string, schedule Schedule, task Task) error 
 
 // wrapTask wraps a task function with execution tracking, error handling,
 // concurrency control, and overlap prevention.
-func (tm *TaskManager) wrapTask(name string, task Task) func() {
+func (tm *TaskManager) wrapTask(name string) func() {
 	return func() {
-		// Check if task is enabled and handle overlap prevention
-		tm.mu.Lock()
-		info := tm.tasks[name]
-		if info == nil || !info.Enabled {
-			tm.mu.Unlock()
-			return
-		}
-
-		// Prevent overlapping executions if configured
-		if !tm.allowOverlapping && info.Running {
-			tm.mu.Unlock()
-			tm.logger.Printf("Task '%s' is already running, skipping this execution", name)
-			return
-		}
-
-		info.Running = true
-		info.LastRun = time.Now()
-		info.RunCount++
-		tm.mu.Unlock()
-
-		// Acquire semaphore if concurrency limit is set
-		if tm.semaphore != nil {
-			select {
-			case tm.semaphore <- struct{}{}:
-				defer func() { <-tm.semaphore }()
-			case <-tm.ctx.Done():
-				tm.mu.Lock()
-				info.Running = false
-				tm.mu.Unlock()
-				return
+		exec, err := tm.beginExecution(name, TriggerScheduled)
+		if err != nil {
+			if !errors.Is(err, ErrTaskNotFound) &&
+				!errors.Is(err, ErrTaskDisabled) &&
+				!errors.Is(err, ErrTaskManagerStopped) {
+				tm.logger.Printf("Task '%s' skipped: %v", name, err)
 			}
+			return
 		}
-
-		// Track execution for graceful shutdown
-		tm.wg.Add(1)
-		defer func() {
-			tm.wg.Done()
-			tm.mu.Lock()
-			info.Running = false
-			tm.mu.Unlock()
-		}()
-
-		// Execute the task
-		startTime := time.Now()
-		if err := task(tm.getTaskContext(name)); err != nil {
-			tm.mu.Lock()
-			info.ErrorCount++
-			info.LastError = err.Error()
-			tm.mu.Unlock()
-			tm.logger.Printf("Task '%s' failed after %v: %v", name, time.Since(startTime), err)
-		} else {
-			tm.mu.Lock()
-			info.LastError = "" // Clear previous error on success
-			tm.mu.Unlock()
-			tm.logger.Printf("Task '%s' completed successfully in %v", name, time.Since(startTime))
-		}
-
-		// Update next run time
-		tm.updateNextRun(name)
+		tm.runExecution(exec)
 	}
 }
 
-// updateNextRun updates the next scheduled run time for a task.
-func (tm *TaskManager) updateNextRun(name string) {
+func (tm *TaskManager) beginExecution(name string, trigger TaskTrigger) (*taskExecution, error) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	if info, ok := tm.tasks[name]; ok {
+	if tm.state == managerStopped {
+		return nil, fmt.Errorf("task %q: %w", name, ErrTaskManagerStopped)
+	}
+
+	info := tm.tasks[name]
+	if info == nil {
+		return nil, fmt.Errorf("task %q: %w", name, ErrTaskNotFound)
+	}
+	if !info.Enabled {
+		return nil, fmt.Errorf("task %q: %w", name, ErrTaskDisabled)
+	}
+	if !tm.allowOverlapping && info.RunningCount > 0 {
+		return nil, fmt.Errorf("task %q: %w", name, ErrTaskRunning)
+	}
+
+	acquiredSlot := false
+	if tm.semaphore != nil {
+		select {
+		case tm.semaphore <- struct{}{}:
+			acquiredSlot = true
+		default:
+			return nil, fmt.Errorf("task %q: %w", name, ErrMaxConcurrencyReached)
+		}
+	}
+
+	now := time.Now()
+	info.RunningCount++
+	info.Running = true
+	info.LastRun = now
+	info.RunCount++
+	tm.wg.Add(1)
+
+	return &taskExecution{
+		name:         name,
+		trigger:      trigger,
+		task:         info.Task,
+		startedAt:    now,
+		runCount:     info.RunCount,
+		runningCount: info.RunningCount,
+		acquiredSlot: acquiredSlot,
+	}, nil
+}
+
+func (tm *TaskManager) runExecution(exec *taskExecution) {
+	_ = tm.runExecutionWithContext(exec, nil)
+}
+
+func (tm *TaskManager) runExecutionWithContext(exec *taskExecution, callerCtx context.Context) error {
+	defer func() {
+		if exec.acquiredSlot {
+			<-tm.semaphore
+		}
+		tm.wg.Done()
+	}()
+
+	ctx, cleanup, err := tm.safeTaskContext(exec.name, callerCtx)
+	if err != nil {
+		finishedAt := time.Now()
+		completeEvent := tm.completeExecution(exec, finishedAt, err)
+		tm.logger.Printf("Task '%s' failed before start after %v: %v", exec.name, completeEvent.Duration, err)
+		tm.fireTaskComplete(completeEvent)
+		return err
+	}
+	defer cleanup()
+
+	tm.fireTaskStart(TaskStartEvent{
+		TaskName:     exec.name,
+		Trigger:      exec.trigger,
+		StartedAt:    exec.startedAt,
+		Context:      ctx,
+		RunCount:     exec.runCount,
+		RunningCount: exec.runningCount,
+	})
+
+	err = tm.callTask(exec.task, ctx)
+	finishedAt := time.Now()
+	completeEvent := tm.completeExecution(exec, finishedAt, err)
+
+	if err != nil {
+		tm.logger.Printf("Task '%s' failed after %v: %v", exec.name, completeEvent.Duration, err)
+	} else {
+		tm.logger.Printf("Task '%s' completed successfully in %v", exec.name, completeEvent.Duration)
+	}
+
+	tm.fireTaskComplete(completeEvent)
+	return err
+}
+
+func (tm *TaskManager) callTask(task Task, ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = panicAsError(r)
+		}
+	}()
+	return task(ctx)
+}
+
+func (tm *TaskManager) safeTaskContext(name string, callerCtx context.Context) (ctx context.Context, cleanup func(), err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = panicAsError(r)
+			cleanup = func() {}
+		}
+	}()
+	base := tm.getTaskContext(name)
+	ctx, cleanup = withCallerCancellation(base, callerCtx)
+	return ctx, cleanup, nil
+}
+
+func withCallerCancellation(base context.Context, caller context.Context) (context.Context, func()) {
+	if caller == nil || caller.Done() == nil {
+		return base, func() {}
+	}
+
+	ctx, cancel := context.WithCancel(base)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-caller.Done():
+			cancel()
+		case <-base.Done():
+			cancel()
+		case <-done:
+		}
+	}()
+
+	return ctx, func() {
+		cancel()
+		close(done)
+	}
+}
+
+func panicAsError(value any) error {
+	if err, ok := value.(error); ok {
+		return fmt.Errorf("task panic: %w", err)
+	}
+	return fmt.Errorf("task panic: %v", value)
+}
+
+func (tm *TaskManager) completeExecution(exec *taskExecution, finishedAt time.Time, taskErr error) TaskCompleteEvent {
+	event := TaskCompleteEvent{
+		TaskName:   exec.name,
+		Trigger:    exec.trigger,
+		StartedAt:  exec.startedAt,
+		FinishedAt: finishedAt,
+		Duration:   finishedAt.Sub(exec.startedAt),
+		Error:      taskErr,
+		RunCount:   exec.runCount,
+	}
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	if info, ok := tm.tasks[exec.name]; ok {
+		if taskErr != nil {
+			info.ErrorCount++
+			info.LastError = taskErr.Error()
+		} else {
+			info.LastError = ""
+		}
+		if info.RunningCount > 0 {
+			info.RunningCount--
+		}
+		info.Running = info.RunningCount > 0
 		entry := tm.cron.Entry(info.EntryID)
 		info.NextRun = entry.Next
+
+		event.RunCount = info.RunCount
+		event.ErrorCount = info.ErrorCount
+		event.RunningCount = info.RunningCount
+	}
+
+	return event
+}
+
+func (tm *TaskManager) fireTaskStart(event TaskStartEvent) {
+	if tm.onTaskStart == nil {
+		return
+	}
+	defer tm.recoverHookPanic("OnTaskStart", event.TaskName)
+	tm.onTaskStart(event)
+}
+
+func (tm *TaskManager) fireTaskComplete(event TaskCompleteEvent) {
+	if tm.onTaskComplete == nil {
+		return
+	}
+	defer tm.recoverHookPanic("OnTaskComplete", event.TaskName)
+	tm.onTaskComplete(event)
+}
+
+func (tm *TaskManager) recoverHookPanic(hookName, taskName string) {
+	if r := recover(); r != nil {
+		tm.logger.Printf("%s hook for task '%s' panicked: %v", hookName, taskName, r)
 	}
 }
 
@@ -276,7 +500,7 @@ func (tm *TaskManager) RemoveTask(name string) error {
 
 	info, exists := tm.tasks[name]
 	if !exists {
-		return fmt.Errorf("task '%s' not found", name)
+		return fmt.Errorf("task %q: %w", name, ErrTaskNotFound)
 	}
 
 	tm.cron.Remove(info.EntryID)
@@ -297,7 +521,7 @@ func (tm *TaskManager) EnableTask(name string) error {
 
 	info, exists := tm.tasks[name]
 	if !exists {
-		return fmt.Errorf("task '%s' not found", name)
+		return fmt.Errorf("task %q: %w", name, ErrTaskNotFound)
 	}
 
 	info.Enabled = true
@@ -317,7 +541,7 @@ func (tm *TaskManager) DisableTask(name string) error {
 
 	info, exists := tm.tasks[name]
 	if !exists {
-		return fmt.Errorf("task '%s' not found", name)
+		return fmt.Errorf("task %q: %w", name, ErrTaskNotFound)
 	}
 
 	info.Enabled = false
@@ -337,13 +561,14 @@ func (tm *TaskManager) GetTask(name string) (*TaskInfo, error) {
 
 	info, exists := tm.tasks[name]
 	if !exists {
-		return nil, fmt.Errorf("task '%s' not found", name)
+		return nil, fmt.Errorf("task %q: %w", name, ErrTaskNotFound)
 	}
 
 	// Update next run time and return a copy
 	entry := tm.cron.Entry(info.EntryID)
 	infoCopy := *info
 	infoCopy.NextRun = entry.Next
+	infoCopy.Running = infoCopy.RunningCount > 0
 
 	return &infoCopy, nil
 }
@@ -359,6 +584,7 @@ func (tm *TaskManager) ListTasks() []*TaskInfo {
 		entry := tm.cron.Entry(info.EntryID)
 		infoCopy := *info
 		infoCopy.NextRun = entry.Next
+		infoCopy.Running = infoCopy.RunningCount > 0
 		tasks = append(tasks, &infoCopy)
 	}
 
@@ -368,7 +594,14 @@ func (tm *TaskManager) ListTasks() []*TaskInfo {
 // Start begins the task scheduler.
 // Tasks will start executing according to their schedules.
 func (tm *TaskManager) Start() {
+	tm.mu.Lock()
+	if tm.state != managerCreated {
+		tm.mu.Unlock()
+		return
+	}
+	tm.state = managerStarted
 	tm.cron.Start()
+	tm.mu.Unlock()
 	tm.logger.Println("Task manager started")
 }
 
@@ -376,6 +609,12 @@ func (tm *TaskManager) Start() {
 // It stops accepting new task executions and waits for running tasks to complete
 // or times out after 30 seconds.
 func (tm *TaskManager) Stop() {
+	tm.mu.Lock()
+	if tm.state == managerStopped {
+		tm.mu.Unlock()
+		return
+	}
+	tm.state = managerStopped
 	tm.logger.Println("Stopping task manager...")
 
 	// Cancel the context to stop new executions
@@ -383,6 +622,7 @@ func (tm *TaskManager) Stop() {
 
 	// Stop the cron scheduler and get its context
 	cronCtx := tm.cron.Stop()
+	tm.mu.Unlock()
 
 	// Wait for all running tasks to complete
 	done := make(chan struct{})
@@ -416,77 +656,36 @@ func (tm *TaskManager) RunTaskNow(name string) error {
 		return fmt.Errorf("task name cannot be empty")
 	}
 
-	tm.mu.Lock()
-	info, exists := tm.tasks[name]
-	if !exists {
-		tm.mu.Unlock()
-		return fmt.Errorf("task '%s' not found", name)
+	exec, err := tm.beginExecution(name, TriggerManual)
+	if err != nil {
+		return err
 	}
 
-	if !info.Enabled {
-		tm.mu.Unlock()
-		return fmt.Errorf("task '%s' is disabled", name)
-	}
-
-	// Check overlap prevention
-	if !tm.allowOverlapping && info.Running {
-		tm.mu.Unlock()
-		return fmt.Errorf("task '%s' is already running", name)
-	}
-
-	info.Running = true
-	info.LastRun = time.Now()
-	info.RunCount++
-	task := info.Task
-	tm.mu.Unlock()
-
-	// Execute task asynchronously
-	go func() {
-		// Acquire semaphore if concurrency limit is set
-		if tm.semaphore != nil {
-			select {
-			case tm.semaphore <- struct{}{}:
-				defer func() { <-tm.semaphore }()
-			case <-tm.ctx.Done():
-				tm.mu.Lock()
-				if taskInfo, ok := tm.tasks[name]; ok {
-					taskInfo.Running = false
-				}
-				tm.mu.Unlock()
-				return
-			}
-		}
-
-		tm.wg.Add(1)
-		defer func() {
-			tm.wg.Done()
-			tm.mu.Lock()
-			if taskInfo, ok := tm.tasks[name]; ok {
-				taskInfo.Running = false
-			}
-			tm.mu.Unlock()
-		}()
-
-		startTime := time.Now()
-		if err := task(tm.getTaskContext(name)); err != nil {
-			tm.mu.Lock()
-			if taskInfo, ok := tm.tasks[name]; ok {
-				taskInfo.ErrorCount++
-				taskInfo.LastError = err.Error()
-			}
-			tm.mu.Unlock()
-			tm.logger.Printf("Manual run of task '%s' failed after %v: %v", name, time.Since(startTime), err)
-		} else {
-			tm.mu.Lock()
-			if taskInfo, ok := tm.tasks[name]; ok {
-				taskInfo.LastError = ""
-			}
-			tm.mu.Unlock()
-			tm.logger.Printf("Manual run of task '%s' completed successfully in %v", name, time.Since(startTime))
-		}
-	}()
-
+	go tm.runExecution(exec)
 	return nil
+}
+
+// RunTaskNowAndWait immediately executes a task and blocks until it completes.
+// The provided context controls cancellation for this manual execution; its values
+// are not injected into the task context. Use WithContextValue or WithContextInjector
+// for task context values.
+func (tm *TaskManager) RunTaskNowAndWait(ctx context.Context, name string) error {
+	if ctx == nil {
+		return ErrNilContext
+	}
+	if name == "" {
+		return fmt.Errorf("task name cannot be empty")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("task %q: %w", name, err)
+	}
+
+	exec, err := tm.beginExecution(name, TriggerManual)
+	if err != nil {
+		return err
+	}
+
+	return tm.runExecutionWithContext(exec, ctx)
 }
 
 // SetContextValue adds or updates a static context value that will be
@@ -531,12 +730,12 @@ func (tm *TaskManager) getTaskContext(name string) context.Context {
 
 	// Inject static context values (copy to avoid holding lock during injection)
 	var contextValues map[string]any
+	tm.mu.RLock()
 	if len(tm.contextValues) > 0 {
-		tm.mu.RLock()
 		contextValues = make(map[string]any, len(tm.contextValues))
 		maps.Copy(contextValues, tm.contextValues)
-		tm.mu.RUnlock()
 	}
+	tm.mu.RUnlock()
 
 	// Apply static values without holding lock
 	for key, value := range contextValues {
@@ -560,6 +759,14 @@ func GetTaskName(ctx context.Context) string {
 	return ""
 }
 
+// ContextValue retrieves a value injected with WithContextValue or SetContextValue.
+func ContextValue(ctx context.Context, key string) any {
+	if key == "" {
+		return nil
+	}
+	return ctx.Value(CtxtKey(key))
+}
+
 // GetStats returns aggregated statistics about the task manager and all tasks.
 func (tm *TaskManager) GetStats() map[string]interface{} {
 	tm.mu.RLock()
@@ -575,7 +782,7 @@ func (tm *TaskManager) GetStats() map[string]interface{} {
 		if info.Enabled {
 			enabledTasks++
 		}
-		if info.Running {
+		if info.RunningCount > 0 {
 			runningTasks++
 		}
 		totalRuns += info.RunCount
@@ -595,179 +802,7 @@ func (tm *TaskManager) GetStats() map[string]interface{} {
 
 // IsRunning checks whether the task manager is currently running.
 func (tm *TaskManager) IsRunning() bool {
-	select {
-	case <-tm.ctx.Done():
-		return false
-	default:
-		return true
-	}
-}
-
-// Schedule represents a task scheduling expression.
-type Schedule interface {
-	String() string
-}
-
-// CronSchedule wraps a standard cron expression string.
-type CronSchedule struct {
-	expression string
-}
-
-// Cron creates a Schedule from a cron expression string.
-// The expression should be in the format: "second minute hour day month weekday"
-func Cron(expr string) *CronSchedule {
-	return &CronSchedule{expression: expr}
-}
-
-// String returns the cron expression.
-func (c *CronSchedule) String() string {
-	return c.expression
-}
-
-// ScheduleBuilder provides a fluent API for building cron schedules.
-type ScheduleBuilder struct {
-	second  string
-	minute  string
-	hour    string
-	day     string
-	month   string
-	weekday string
-}
-
-// String converts the builder to a cron expression string.
-func (s *ScheduleBuilder) String() string {
-	return fmt.Sprintf("%s %s %s %s %s %s",
-		s.second, s.minute, s.hour, s.day, s.month, s.weekday)
-}
-
-// Every creates a new ScheduleBuilder with default values (runs every minute).
-func Every() *ScheduleBuilder {
-	return &ScheduleBuilder{
-		second:  "0",
-		minute:  "*",
-		hour:    "*",
-		day:     "*",
-		month:   "*",
-		weekday: "*",
-	}
-}
-
-// Second configures the schedule to run every second.
-func (s *ScheduleBuilder) Second() *ScheduleBuilder {
-	s.second = "*"
-	s.minute = "*"
-	s.hour = "*"
-	return s
-}
-
-// Minute configures the schedule to run every minute (at 0 seconds).
-func (s *ScheduleBuilder) Minute() *ScheduleBuilder {
-	s.second = "0"
-	s.minute = "*"
-	s.hour = "*"
-	return s
-}
-
-// Hour configures the schedule to run every hour (at 0 minutes, 0 seconds).
-func (s *ScheduleBuilder) Hour() *ScheduleBuilder {
-	s.second = "0"
-	s.minute = "0"
-	s.hour = "*"
-	return s
-}
-
-// Day configures the schedule to run every day (at midnight).
-func (s *ScheduleBuilder) Day() *ScheduleBuilder {
-	s.second = "0"
-	s.minute = "0"
-	s.hour = "0"
-	s.day = "*"
-	return s
-}
-
-// Seconds configures the schedule to run at the specified second interval.
-// For example, Seconds(30) runs every 30 seconds.
-// Interval must be positive, otherwise the method panics.
-func (s *ScheduleBuilder) Seconds(interval int) *ScheduleBuilder {
-	if interval <= 0 {
-		panic("interval must be positive")
-	}
-	s.second = fmt.Sprintf("*/%d", interval)
-	s.minute = "*"
-	s.hour = "*"
-	return s
-}
-
-// Minutes configures the schedule to run at the specified minute interval.
-// For example, Minutes(15) runs every 15 minutes.
-// Interval must be positive, otherwise the method panics.
-func (s *ScheduleBuilder) Minutes(interval int) *ScheduleBuilder {
-	if interval <= 0 {
-		panic("interval must be positive")
-	}
-	s.second = "0"
-	s.minute = fmt.Sprintf("*/%d", interval)
-	s.hour = "*"
-	return s
-}
-
-// Hours configures the schedule to run at the specified hour interval.
-// For example, Hours(6) runs every 6 hours.
-// Interval must be positive, otherwise the method panics.
-func (s *ScheduleBuilder) Hours(interval int) *ScheduleBuilder {
-	if interval <= 0 {
-		panic("interval must be positive")
-	}
-	s.second = "0"
-	s.minute = "0"
-	s.hour = fmt.Sprintf("*/%d", interval)
-	return s
-}
-
-// Days configures the schedule to run at the specified day interval.
-// For example, Days(2) runs every 2 days at midnight.
-// Interval must be positive, otherwise the method panics.
-func (s *ScheduleBuilder) Days(interval int) *ScheduleBuilder {
-	if interval <= 0 {
-		panic("interval must be positive")
-	}
-	s.second = "0"
-	s.minute = "0"
-	s.hour = "0"
-	s.day = fmt.Sprintf("*/%d", interval)
-	return s
-}
-
-// At specifies a specific time of day for the schedule.
-// For example, At(14, 30) runs at 2:30 PM.
-// Hour must be 0-23 and minute must be 0-59, otherwise the method panics.
-func (s *ScheduleBuilder) At(hour, minute int) *ScheduleBuilder {
-	if hour < 0 || hour > 23 {
-		panic("hour must be between 0 and 23")
-	}
-	if minute < 0 || minute > 59 {
-		panic("minute must be between 0 and 59")
-	}
-	s.second = "0"
-	s.minute = fmt.Sprintf("%d", minute)
-	s.hour = fmt.Sprintf("%d", hour)
-	return s
-}
-
-// OnWeekday restricts the schedule to a specific day of the week.
-// For example, OnWeekday(time.Monday) runs only on Mondays.
-func (s *ScheduleBuilder) OnWeekday(weekday time.Weekday) *ScheduleBuilder {
-	s.weekday = fmt.Sprintf("%d", weekday)
-	return s
-}
-
-// OnDay restricts the schedule to a specific day of the month.
-// For example, OnDay(15) runs on the 15th of each month.
-// Day must be between 1 and 31, otherwise the method panics.
-func (s *ScheduleBuilder) OnDay(day int) *ScheduleBuilder {
-	if day < 1 || day > 31 {
-		panic("day must be between 1 and 31")
-	}
-	s.day = fmt.Sprintf("%d", day)
-	return s
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+	return tm.state == managerStarted
 }
