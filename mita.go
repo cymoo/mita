@@ -95,18 +95,45 @@ type TaskSkipEvent struct {
 	Reason    error // ErrTaskRunning or ErrMaxConcurrencyReached
 }
 
+// EventKind classifies an entry in the manager's recent-event buffer.
+type EventKind string
+
+const (
+	EventCompleted EventKind = "completed" // execution finished successfully
+	EventFailed    EventKind = "failed"    // execution returned an error or panicked
+	EventSkipped   EventKind = "skipped"   // execution rejected by overlap/concurrency rules
+	EventLifecycle EventKind = "lifecycle" // task added/removed/paused/resumed/rescheduled, manual trigger
+)
+
+// Event is one entry in the manager's bounded recent-event buffer.
+// The buffer holds the last eventBufferCap events across all tasks and is
+// intended for observability surfaces such as the web UI.
+type Event struct {
+	At       time.Time
+	Kind     EventKind
+	TaskName string
+	Message  string
+	Duration time.Duration // execution duration; zero for skips and lifecycle events
+}
+
+// eventBufferCap is the size of the recent-event ring buffer.
+const eventBufferCap = 256
+
 // TaskInfo is an immutable snapshot of a task's metadata and statistics.
 type TaskInfo struct {
-	Name         string    // Unique identifier for the task
-	Schedule     string    // Cron expression for the task schedule
-	AddedAt      time.Time // When the task was added to the manager
-	LastRun      time.Time // Start time of the most recent execution
-	NextRun      time.Time // Next scheduled execution time
-	RunCount     int64     // Total number of executions
-	ErrorCount   int64     // Total number of failed executions
-	LastError    string    // Most recent error message (empty if last run succeeded)
-	Enabled      bool      // Whether the task is enabled for scheduled execution
-	RunningCount int       // Number of currently executing instances
+	Name             string        // Unique identifier for the task
+	Schedule         string        // Cron expression for the task schedule
+	AddedAt          time.Time     // When the task was added to the manager
+	LastRun          time.Time     // Start time of the most recent execution
+	NextRun          time.Time     // Next scheduled execution time
+	RunCount         int64         // Total number of executions
+	ErrorCount       int64         // Total number of failed executions
+	SkipCount        int64         // Executions rejected by overlap/concurrency rules
+	LastError        string        // Most recent error message (empty if last run succeeded)
+	Enabled          bool          // Whether the task is enabled for scheduled execution
+	RunningCount     int           // Number of currently executing instances
+	Timeout          time.Duration // Per-execution timeout (0 = none)
+	AllowOverlapping bool          // Effective overlap policy (per-task override or manager default)
 }
 
 // Running reports whether the task had at least one executing instance when
@@ -122,8 +149,10 @@ type Stats struct {
 	RunningTasks     int
 	TotalRuns        int64
 	TotalErrors      int64
+	TotalSkips       int64
 	MaxConcurrent    int
 	AllowOverlapping bool
+	StartedAt        time.Time // When Start was called (zero if not started)
 }
 
 // taskEntry is the internal, mutable state of a registered task.
@@ -136,6 +165,7 @@ type taskEntry struct {
 	lastRun      time.Time
 	runCount     int64
 	errorCount   int64
+	skipCount    int64
 	lastError    string
 	enabled      bool
 	runningCount int
@@ -143,18 +173,26 @@ type taskEntry struct {
 }
 
 // snapshot returns a copy of the entry's public state.
-func (e *taskEntry) snapshot(nextRun time.Time) TaskInfo {
+// managerOverlap is the manager-level default used when the task has no override.
+func (e *taskEntry) snapshot(nextRun time.Time, managerOverlap bool) TaskInfo {
+	overlap := managerOverlap
+	if e.settings.overlap != nil {
+		overlap = *e.settings.overlap
+	}
 	return TaskInfo{
-		Name:         e.name,
-		Schedule:     e.schedule,
-		AddedAt:      e.addedAt,
-		LastRun:      e.lastRun,
-		NextRun:      nextRun,
-		RunCount:     e.runCount,
-		ErrorCount:   e.errorCount,
-		LastError:    e.lastError,
-		Enabled:      e.enabled,
-		RunningCount: e.runningCount,
+		Name:             e.name,
+		Schedule:         e.schedule,
+		AddedAt:          e.addedAt,
+		LastRun:          e.lastRun,
+		NextRun:          nextRun,
+		RunCount:         e.runCount,
+		ErrorCount:       e.errorCount,
+		SkipCount:        e.skipCount,
+		LastError:        e.lastError,
+		Enabled:          e.enabled,
+		RunningCount:     e.runningCount,
+		Timeout:          e.settings.timeout,
+		AllowOverlapping: overlap,
 	}
 }
 
@@ -179,6 +217,9 @@ type TaskManager struct {
 	onTaskComplete   func(TaskCompleteEvent)                                    // Called after a task completes
 	onTaskSkip       func(TaskSkipEvent)                                        // Called when an execution is skipped
 	state            managerState                                               // Manager lifecycle state
+	startedAt        time.Time                                                  // When Start was called
+	events           [eventBufferCap]Event                                      // Ring buffer of recent events
+	eventCount       int                                                        // Total events ever recorded
 }
 
 // taskSettings holds per-task configuration applied via TaskOption.
@@ -407,6 +448,7 @@ func (tm *TaskManager) AddTask(name string, schedule Schedule, task Task, opts .
 		settings: settings,
 	}
 
+	tm.recordEventLocked(EventLifecycle, name, "task added — "+expr, 0)
 	tm.logger.Printf("Task '%s' added with schedule: %s", name, expr)
 	return nil
 }
@@ -448,6 +490,7 @@ func (tm *TaskManager) UpdateSchedule(name string, schedule Schedule) error {
 	e.entryID = entryID
 	e.schedule = expr
 
+	tm.recordEventLocked(EventLifecycle, name, "schedule updated — "+expr, 0)
 	tm.logger.Printf("Task '%s' schedule updated to: %s", name, expr)
 	return nil
 }
@@ -489,6 +532,8 @@ func (tm *TaskManager) beginExecution(name string, trigger TaskTrigger) (*taskEx
 		allowOverlap = *e.settings.overlap
 	}
 	if !allowOverlap && e.runningCount > 0 {
+		e.skipCount++
+		tm.recordEventLocked(EventSkipped, name, skipMessage(trigger, "previous run still in flight"), 0)
 		return nil, fmt.Errorf("task %q: %w", name, ErrTaskRunning)
 	}
 
@@ -498,6 +543,8 @@ func (tm *TaskManager) beginExecution(name string, trigger TaskTrigger) (*taskEx
 		case tm.semaphore <- struct{}{}:
 			acquiredSlot = true
 		default:
+			e.skipCount++
+			tm.recordEventLocked(EventSkipped, name, skipMessage(trigger, "max concurrency reached"), 0)
 			return nil, fmt.Errorf("task %q: %w", name, ErrMaxConcurrencyReached)
 		}
 	}
@@ -518,6 +565,45 @@ func (tm *TaskManager) beginExecution(name string, trigger TaskTrigger) (*taskEx
 		runningCount: e.runningCount,
 		acquiredSlot: acquiredSlot,
 	}, nil
+}
+
+// recordEventLocked appends an event to the ring buffer. Callers must hold tm.mu.
+func (tm *TaskManager) recordEventLocked(kind EventKind, taskName, message string, dur time.Duration) {
+	tm.events[tm.eventCount%eventBufferCap] = Event{
+		At:       time.Now(),
+		Kind:     kind,
+		TaskName: taskName,
+		Message:  message,
+		Duration: dur,
+	}
+	tm.eventCount++
+}
+
+// recordEvent appends an event to the ring buffer, taking the lock.
+func (tm *TaskManager) recordEvent(kind EventKind, taskName, message string, dur time.Duration) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	tm.recordEventLocked(kind, taskName, message, dur)
+}
+
+// RecentEvents returns up to limit most-recent events, newest first.
+// A non-positive limit returns the full buffer (at most eventBufferCap entries).
+func (tm *TaskManager) RecentEvents(limit int) []Event {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	n := tm.eventCount
+	if n > eventBufferCap {
+		n = eventBufferCap
+	}
+	if limit > 0 && limit < n {
+		n = limit
+	}
+	out := make([]Event, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, tm.events[(tm.eventCount-1-i)%eventBufferCap])
+	}
+	return out
 }
 
 // noteSkip logs and reports executions rejected by overlap prevention or the
@@ -661,8 +747,20 @@ func (tm *TaskManager) completeExecution(exec *taskExecution, finishedAt time.Ti
 		event.ErrorCount = e.errorCount
 		event.RunningCount = e.runningCount
 	}
+	if taskErr != nil {
+		tm.recordEventLocked(EventFailed, exec.name, taskErr.Error(), event.Duration)
+	} else {
+		tm.recordEventLocked(EventCompleted, exec.name, "completed", event.Duration)
+	}
 
 	return event
+}
+
+func skipMessage(trigger TaskTrigger, reason string) string {
+	if trigger == TriggerManual {
+		return "manual run rejected — " + reason
+	}
+	return "skipped — " + reason
 }
 
 func (tm *TaskManager) fireTaskStart(event TaskStartEvent) {
@@ -704,6 +802,7 @@ func (tm *TaskManager) RemoveTask(name string) error {
 
 	tm.cron.Remove(e.entryID)
 	delete(tm.tasks, name)
+	tm.recordEventLocked(EventLifecycle, name, "task removed", 0)
 	tm.logger.Printf("Task '%s' removed", name)
 	return nil
 }
@@ -724,6 +823,7 @@ func (tm *TaskManager) EnableTask(name string) error {
 	}
 
 	e.enabled = true
+	tm.recordEventLocked(EventLifecycle, name, "schedule resumed", 0)
 	tm.logger.Printf("Task '%s' enabled", name)
 	return nil
 }
@@ -745,6 +845,7 @@ func (tm *TaskManager) DisableTask(name string) error {
 	}
 
 	e.enabled = false
+	tm.recordEventLocked(EventLifecycle, name, "schedule paused — manual runs still allowed", 0)
 	tm.logger.Printf("Task '%s' disabled", name)
 	return nil
 }
@@ -764,7 +865,7 @@ func (tm *TaskManager) GetTask(name string) (TaskInfo, error) {
 		return TaskInfo{}, fmt.Errorf("task %q: %w", name, ErrTaskNotFound)
 	}
 
-	return e.snapshot(tm.cron.Entry(e.entryID).Next), nil
+	return e.snapshot(tm.cron.Entry(e.entryID).Next, tm.allowOverlapping), nil
 }
 
 // ListTasks returns a snapshot of all task information, sorted by task name.
@@ -781,11 +882,82 @@ func (tm *TaskManager) ListTasks() []TaskInfo {
 
 	tasks := make([]TaskInfo, 0, len(tm.tasks))
 	for _, e := range tm.tasks {
-		tasks = append(tasks, e.snapshot(nextRuns[e.entryID]))
+		tasks = append(tasks, e.snapshot(nextRuns[e.entryID], tm.allowOverlapping))
 	}
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].Name < tasks[j].Name })
 
 	return tasks
+}
+
+// UpcomingRuns returns, for every enabled task, its scheduled fire times within
+// the given window, capped at perTaskLimit entries per task (60 if non-positive).
+// Disabled tasks map to a nil slice. The whole call takes a single cron snapshot.
+func (tm *TaskManager) UpcomingRuns(within time.Duration, perTaskLimit int) map[string][]time.Time {
+	if within <= 0 {
+		within = 5 * time.Minute
+	}
+	if perTaskLimit <= 0 {
+		perTaskLimit = 60
+	}
+
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	schedules := make(map[cron.EntryID]cron.Schedule, len(tm.tasks))
+	for _, entry := range tm.cron.Entries() {
+		schedules[entry.ID] = entry.Schedule
+	}
+
+	now := time.Now()
+	until := now.Add(within)
+	out := make(map[string][]time.Time, len(tm.tasks))
+	for name, e := range tm.tasks {
+		if !e.enabled {
+			out[name] = nil
+			continue
+		}
+		sched := schedules[e.entryID]
+		if sched == nil {
+			continue
+		}
+		var fires []time.Time
+		for t := sched.Next(now); !t.IsZero() && !t.After(until) && len(fires) < perTaskLimit; t = sched.Next(t) {
+			fires = append(fires, t)
+		}
+		out[name] = fires
+	}
+	return out
+}
+
+// PreviewSchedule validates a schedule and returns its normalized expression
+// together with its next n fire times (in the manager's timezone). The schedule
+// is not registered; use this to validate user input before UpdateSchedule.
+func (tm *TaskManager) PreviewSchedule(schedule Schedule, n int) (string, []time.Time, error) {
+	if schedule == nil {
+		return "", nil, fmt.Errorf("schedule cannot be nil")
+	}
+	if n <= 0 {
+		n = 3
+	}
+
+	expr, err := scheduleExpr(schedule)
+	if err != nil {
+		return "", nil, err
+	}
+	spec, err := cronParser.Parse(expr)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid schedule: %w", err)
+	}
+
+	loc := time.Local
+	if tm.location != nil {
+		loc = tm.location
+	}
+	fires := make([]time.Time, 0, n)
+	for t := spec.Next(time.Now().In(loc)); !t.IsZero() && len(fires) < n; t = spec.Next(t) {
+		fires = append(fires, t)
+	}
+	return expr, fires, nil
 }
 
 // Start begins the task scheduler.
@@ -803,7 +975,9 @@ func (tm *TaskManager) Start() error {
 		return ErrTaskManagerStopped
 	}
 	tm.state = managerStarted
+	tm.startedAt = time.Now()
 	tm.cron.Start()
+	tm.recordEventLocked(EventLifecycle, "", "scheduler started", 0)
 	tm.logger.Println("Task manager started")
 	return nil
 }
@@ -832,6 +1006,7 @@ func (tm *TaskManager) StopContext(ctx context.Context) error {
 	}
 	tm.state = managerStopped
 	tm.cron.Stop()
+	tm.recordEventLocked(EventLifecycle, "", "scheduler stopping", 0)
 	tm.mu.Unlock()
 
 	tm.logger.Println("Stopping task manager...")
@@ -875,6 +1050,7 @@ func (tm *TaskManager) RunTaskNow(name string) (<-chan error, error) {
 		tm.noteSkip(name, TriggerManual, err)
 		return nil, err
 	}
+	tm.recordEvent(EventLifecycle, name, "manual run triggered", 0)
 
 	done := make(chan error, 1)
 	go func() {
@@ -903,6 +1079,7 @@ func (tm *TaskManager) RunTaskNowAndWait(ctx context.Context, name string) error
 		tm.noteSkip(name, TriggerManual, err)
 		return err
 	}
+	tm.recordEvent(EventLifecycle, name, "manual run triggered", 0)
 
 	return tm.runExecution(exec, ctx)
 }
@@ -995,6 +1172,7 @@ func (tm *TaskManager) Stats() Stats {
 		TotalTasks:       len(tm.tasks),
 		MaxConcurrent:    tm.maxConcurrent,
 		AllowOverlapping: tm.allowOverlapping,
+		StartedAt:        tm.startedAt,
 	}
 
 	for _, e := range tm.tasks {
@@ -1006,6 +1184,7 @@ func (tm *TaskManager) Stats() Stats {
 		}
 		stats.TotalRuns += e.runCount
 		stats.TotalErrors += e.errorCount
+		stats.TotalSkips += e.skipCount
 	}
 
 	return stats

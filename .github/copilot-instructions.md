@@ -42,15 +42,26 @@ The only external dependency is `github.com/robfig/cron/v3`, used as the underly
 - When the global concurrency cap is full, scheduled executions are skipped and manual runs return `ErrMaxConcurrencyReached`; there is no hidden queue. Skips due to overlap or the cap fire the `WithOnTaskSkip` hook.
 - `completeExecution` must not call into `cron` (each `cron.Entry` lookup snapshots the whole entry list); `NextRun` is resolved only in `GetTask`/`ListTasks`, and `ListTasks` uses a single `cron.Entries()` call.
 
-**Web UI routes** (all mounted under the `baseURL` prefix):
+**Web UI routes** (all mounted under the `baseURL` prefix, Go 1.22 method patterns):
 
 | Route | Handler |
 |---|---|
-| `GET /` | Task list page |
-| `GET /stats` | Aggregated stats page |
-| `POST /action` | Enable/disable/run/remove a task |
-| `GET /api` | JSON task data (used by the list page) |
+| `GET /{$}` | Single-page dashboard (light/dark, vanilla JS in `index.html`) |
 | `GET /assets/styles.css` | Embedded CSS |
+| `GET /api/state?window=SECONDS` | Snapshot: stats, tasks (+ upcoming fire times), recent events |
+| `GET /api/schedule/preview?expr=` | Validate an expression, return normalized form + next fires |
+| `POST /api/tasks/{name}/{action}` | `run`/`pause`/`resume`/`remove`/`schedule` (JSON `{"expr":...}`) |
+
+Status codes come from `ui.StatusError`, which the `web.go` adapter wraps around
+manager errors (`webError`): 404 not-found, 409 running/concurrency/exists,
+503 stopped, 400 everything else. The `ui` package never imports `mita`
+(mita → ui is the only direction), which is why the adapter does the mapping.
+
+The manager feeds the UI via `RecentEvents` (a bounded in-manager ring buffer of
+`Event`s recorded on completion/failure/skip/lifecycle), `UpcomingRuns` (bulk
+next-fire times, one cron snapshot), and `PreviewSchedule`. `humanizeExpr` in
+`ui/format.go` renders common expressions as phrases and falls back to the raw
+expression.
 
 The web UI has no built-in auth; destructive actions are exposed, so it must be wrapped with auth middleware in real deployments.
 

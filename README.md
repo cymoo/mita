@@ -621,20 +621,29 @@ func main() {
 
 ### Web Interface Features
 
-The web interface provides:
+The web interface is a single live dashboard (light & dark themes, follows the
+system preference) with:
 
-- **📋 Task List Page** (`/tasks/`) - View all tasks with:
-  - Real-time status (Enabled/Disabled/Running)
-  - Execution statistics and success rates
-  - Last run time and next scheduled run
-  - Error information for failed tasks
-  - Action buttons: Enable, Disable, Run Now, Remove
+- **Overview** — big-number stats: tasks, running now, executions, errors, success rate
+- **Schedule board** — one row per task with a live *horizon timeline*: upcoming
+  fires drift toward the NOW line in real time (5m / 15m / 1h window)
+- **Activity feed** — live stream of completions, failures, **skips**
+  (overlap/concurrency rejections), and lifecycle events
+- **Task drawer** — click a task for details: schedule editing with live
+  validation and next-fire preview (`UpdateSchedule`), execution policy
+  (per-task timeout, overlap), statistics, recent events, and removal
+- **Actions** — run now, pause/resume (manual runs still work while paused), remove
 
-- **📊 Statistics Page** (`/tasks/stats`) - View aggregated metrics:
-  - Total tasks, enabled tasks, running tasks
-  - Total executions and error counts
-  - Concurrency settings
-  - Per-task performance with visual progress bars
+The JSON API behind it:
+
+| Route | Description |
+|---|---|
+| `GET  {base}/api/state?window=SECONDS` | Full snapshot: stats, tasks, upcoming runs, events |
+| `GET  {base}/api/schedule/preview?expr=...` | Validate an expression, get next fires |
+| `POST {base}/api/tasks/{name}/{action}` | `run` \| `pause` \| `resume` \| `remove` \| `schedule` (JSON body `{"expr":"..."}`) |
+
+Errors use meaningful status codes: 404 unknown task, 409 overlap/concurrency
+conflict, 400 invalid input, plus a JSON body `{"error": "..."}`.
 
 ### Mounting at Custom Paths
 

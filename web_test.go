@@ -8,30 +8,17 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWebHandlerRoutesAndAssets(t *testing.T) {
 	tests := []struct {
-		name      string
-		baseURL   string
-		indexPath string
-		apiPath   string
-		cssPath   string
+		name    string
+		baseURL string
+		prefix  string
 	}{
-		{
-			name:      "root",
-			baseURL:   "",
-			indexPath: "/",
-			apiPath:   "/api",
-			cssPath:   "/assets/styles.css",
-		},
-		{
-			name:      "mounted",
-			baseURL:   "/tasks",
-			indexPath: "/tasks/",
-			apiPath:   "/tasks/api",
-			cssPath:   "/tasks/assets/styles.css",
-		},
+		{name: "root", baseURL: "", prefix: ""},
+		{name: "mounted", baseURL: "/tasks", prefix: "/tasks"},
 	}
 
 	for _, tt := range tests {
@@ -43,205 +30,274 @@ func TestWebHandlerRoutesAndAssets(t *testing.T) {
 			}
 			handler := tm.WebHandler(tt.baseURL)
 
-			indexReq := httptest.NewRequest(http.MethodGet, tt.indexPath, nil)
-			indexRec := httptest.NewRecorder()
-			handler.ServeHTTP(indexRec, indexReq)
-			if indexRec.Code != http.StatusOK {
-				t.Fatalf("index status = %d, want %d", indexRec.Code, http.StatusOK)
-			}
-			if body := indexRec.Body.String(); !strings.Contains(body, "mita") {
-				t.Fatalf("index body missing expected content")
+			get := func(path string) *httptest.ResponseRecorder {
+				rec := httptest.NewRecorder()
+				handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tt.prefix+path, nil))
+				return rec
 			}
 
-			apiReq := httptest.NewRequest(http.MethodGet, tt.apiPath, nil)
-			apiRec := httptest.NewRecorder()
-			handler.ServeHTTP(apiRec, apiReq)
-			if apiRec.Code != http.StatusOK {
-				t.Fatalf("api status = %d, want %d", apiRec.Code, http.StatusOK)
+			if rec := get("/"); rec.Code != http.StatusOK {
+				t.Fatalf("index status = %d, want 200", rec.Code)
+			} else if !strings.Contains(rec.Body.String(), "mita") {
+				t.Fatal("index body missing expected content")
 			}
-			if !strings.Contains(apiRec.Body.String(), "web-test") {
-				t.Fatalf("api response missing task name")
+			if rec := get("/assets/styles.css"); rec.Code != http.StatusOK {
+				t.Fatalf("css status = %d, want 200", rec.Code)
 			}
-
-			cssReq := httptest.NewRequest(http.MethodGet, tt.cssPath, nil)
-			cssRec := httptest.NewRecorder()
-			handler.ServeHTTP(cssRec, cssReq)
-			if cssRec.Code != http.StatusOK {
-				t.Fatalf("css status = %d, want %d", cssRec.Code, http.StatusOK)
+			if rec := get("/api/state"); rec.Code != http.StatusOK {
+				t.Fatalf("state status = %d, want 200", rec.Code)
+			} else if !strings.Contains(rec.Body.String(), "web-test") {
+				t.Fatal("state response missing task name")
 			}
-			if ct := cssRec.Header().Get("Content-Type"); !strings.Contains(ct, "text/css") {
-				t.Fatalf("css Content-Type = %q, want text/css", ct)
+			if rec := get("/not-a-real-path"); rec.Code != http.StatusNotFound {
+				t.Fatalf("unknown path status = %d, want 404", rec.Code)
 			}
 		})
 	}
 }
 
-func TestWebHandlerAPIReturnsJSON(t *testing.T) {
-	tm := New()
+func TestWebHandlerState(t *testing.T) {
+	tm := New(WithMaxConcurrent(3))
 	defer tm.Stop()
-	if err := tm.AddTask("api-task", Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
+	if err := tm.AddTask("api-task", Every().Seconds(30), func(ctx context.Context) error { return nil },
+		WithTaskTimeout(45*time.Second)); err != nil {
 		t.Fatalf("AddTask() failed: %v", err)
+	}
+	if err := tm.RunTaskNowAndWait(context.Background(), "api-task"); err != nil {
+		t.Fatalf("RunTaskNowAndWait() failed: %v", err)
+	}
+	if err := tm.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
 	}
 	handler := tm.WebHandler("")
 
-	req := httptest.NewRequest(http.MethodGet, "/api", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/state?window=300", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
-	}
-	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
-		t.Fatalf("Content-Type = %q, want application/json", ct)
-	}
-	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
-		t.Fatalf("Cache-Control = %q, want no-store", cc)
+		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 
 	var resp struct {
-		Tasks []struct {
-			Name         string `json:"name"`
-			Enabled      bool   `json:"enabled"`
-			RunningCount int    `json:"running_count"`
-		} `json:"tasks"`
+		Now   time.Time `json:"now"`
 		Stats struct {
-			TotalTasks int `json:"total_tasks"`
+			TotalTasks    int        `json:"total_tasks"`
+			MaxConcurrent int        `json:"max_concurrent"`
+			StartedAt     *time.Time `json:"started_at"`
 		} `json:"stats"`
+		Tasks []struct {
+			Name      string      `json:"name"`
+			Meaning   string      `json:"meaning"`
+			RunCount  int64       `json:"run_count"`
+			TimeoutMs int64       `json:"timeout_ms"`
+			Upcoming  []time.Time `json:"upcoming"`
+		} `json:"tasks"`
+		Events []struct {
+			Kind string `json:"kind"`
+			Task string `json:"task"`
+		} `json:"events"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("failed to decode JSON: %v", err)
 	}
-	if len(resp.Tasks) != 1 || resp.Tasks[0].Name != "api-task" {
-		t.Fatalf("unexpected tasks in API response: %+v", resp.Tasks)
+
+	if resp.Stats.TotalTasks != 1 || resp.Stats.MaxConcurrent != 3 {
+		t.Fatalf("unexpected stats: %+v", resp.Stats)
 	}
-	if resp.Tasks[0].RunningCount != 0 {
-		t.Fatalf("running_count = %d, want 0", resp.Tasks[0].RunningCount)
+	if resp.Stats.StartedAt == nil {
+		t.Fatal("started_at missing after Start()")
 	}
-	if resp.Stats.TotalTasks != 1 {
-		t.Fatalf("total_tasks = %d, want 1", resp.Stats.TotalTasks)
+	task := resp.Tasks[0]
+	if task.Meaning != "every 30s" || task.RunCount != 1 || task.TimeoutMs != 45000 {
+		t.Fatalf("unexpected task: %+v", task)
+	}
+	// every-30s task must have upcoming fires inside a 5-minute window
+	if len(task.Upcoming) < 5 {
+		t.Fatalf("upcoming = %d fires, want >= 5", len(task.Upcoming))
+	}
+	// the completed manual run must be in the event feed
+	foundCompleted := false
+	for _, ev := range resp.Events {
+		if ev.Kind == "completed" && ev.Task == "api-task" {
+			foundCompleted = true
+		}
+	}
+	if !foundCompleted {
+		t.Fatalf("completed event missing from feed: %+v", resp.Events)
 	}
 }
 
-func TestWebHandlerActionReturnsJSON(t *testing.T) {
+func TestWebHandlerActions(t *testing.T) {
 	tm := New()
 	defer tm.Stop()
-
-	taskName := "action-test"
-	if err := tm.AddTask(taskName, Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
+	if err := tm.AddTask("action-test", Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
 		t.Fatalf("AddTask() failed: %v", err)
 	}
 	handler := tm.WebHandler("/tasks")
 
-	t.Run("valid action returns ok=true", func(t *testing.T) {
-		form := url.Values{}
-		form.Set("name", taskName)
-		form.Set("action", "disable")
-
-		req := httptest.NewRequest(http.MethodPost, "/tasks/action", strings.NewReader(form.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	post := func(path, body string) *httptest.ResponseRecorder {
+		var rd *strings.Reader
+		if body != "" {
+			rd = strings.NewReader(body)
+		} else {
+			rd = strings.NewReader("")
+		}
+		req := httptest.NewRequest(http.MethodPost, path, rd)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
+		return rec
+	}
 
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	t.Run("pause and resume", func(t *testing.T) {
+		if rec := post("/tasks/api/tasks/action-test/pause", ""); rec.Code != http.StatusOK {
+			t.Fatalf("pause status = %d: %s", rec.Code, rec.Body.String())
 		}
-		if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
-			t.Fatalf("Content-Type = %q, want application/json", ct)
+		info, _ := tm.GetTask("action-test")
+		if info.Enabled {
+			t.Fatal("task still enabled after pause")
 		}
-
-		var result struct {
-			OK    bool   `json:"ok"`
-			Error string `json:"error"`
-		}
-		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-			t.Fatalf("failed to decode JSON: %v", err)
-		}
-		if !result.OK {
-			t.Fatalf("ok = false, want true; error = %q", result.Error)
+		if rec := post("/tasks/api/tasks/action-test/resume", ""); rec.Code != http.StatusOK {
+			t.Fatalf("resume status = %d: %s", rec.Code, rec.Body.String())
 		}
 	})
 
-	t.Run("unknown task returns ok=false", func(t *testing.T) {
-		form := url.Values{}
-		form.Set("name", "no-such-task")
-		form.Set("action", "run")
-
-		req := httptest.NewRequest(http.MethodPost, "/tasks/action", strings.NewReader(form.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
-
-		var result struct {
-			OK    bool   `json:"ok"`
-			Error string `json:"error"`
+	t.Run("reschedule", func(t *testing.T) {
+		if rec := post("/tasks/api/tasks/action-test/schedule", `{"expr":"*/5 * * * *"}`); rec.Code != http.StatusOK {
+			t.Fatalf("schedule status = %d: %s", rec.Code, rec.Body.String())
 		}
-		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-			t.Fatalf("failed to decode JSON: %v", err)
-		}
-		if result.OK {
-			t.Fatalf("ok = true, want false for unknown task")
-		}
-		if result.Error == "" {
-			t.Fatalf("expected non-empty error message")
+		info, _ := tm.GetTask("action-test")
+		if info.Schedule != "0 */5 * * * *" {
+			t.Fatalf("Schedule = %q, want normalized %q", info.Schedule, "0 */5 * * * *")
 		}
 	})
 
-	t.Run("missing params returns ok=false", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/tasks/action", strings.NewReader(""))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
-
-		var result struct {
-			OK bool `json:"ok"`
+	t.Run("invalid schedule is 400 and leaves task unchanged", func(t *testing.T) {
+		rec := post("/tasks/api/tasks/action-test/schedule", `{"expr":"*/90 * * * * *"}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
 		}
-		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-			t.Fatalf("failed to decode JSON: %v", err)
-		}
-		if result.OK {
-			t.Fatalf("ok = true, want false for missing params")
+		info, _ := tm.GetTask("action-test")
+		if info.Schedule != "0 */5 * * * *" {
+			t.Fatalf("Schedule changed to %q after invalid update", info.Schedule)
 		}
 	})
 
-	t.Run("task name with special chars is handled safely", func(t *testing.T) {
-		specialName := "line\r\nbreak & task"
-		if err := tm.AddTask(specialName, Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
+	t.Run("unknown task is 404", func(t *testing.T) {
+		if rec := post("/tasks/api/tasks/nope/run", ""); rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rec.Code)
+		}
+	})
+
+	t.Run("conflict is 409", func(t *testing.T) {
+		release := make(chan struct{})
+		started := make(chan struct{})
+		if err := tm.AddTask("busy", Every().Minute(), func(ctx context.Context) error {
+			close(started)
+			<-release
+			return nil
+		}); err != nil {
 			t.Fatalf("AddTask() failed: %v", err)
 		}
-
-		form := url.Values{}
-		form.Set("name", specialName)
-		form.Set("action", "disable")
-
-		req := httptest.NewRequest(http.MethodPost, "/tasks/action", strings.NewReader(form.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
-
-		if strings.ContainsAny(rec.Header().Get("Content-Type"), "\r\n") {
-			t.Fatalf("Content-Type header contains CRLF")
+		if rec := post("/tasks/api/tasks/busy/run", ""); rec.Code != http.StatusOK {
+			t.Fatalf("first run status = %d", rec.Code)
 		}
-		var result struct {
-			OK bool `json:"ok"`
+		<-started
+		if rec := post("/tasks/api/tasks/busy/run", ""); rec.Code != http.StatusConflict {
+			t.Fatalf("second run status = %d, want 409: %s", rec.Code, rec.Body.String())
 		}
-		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
-			t.Fatalf("failed to decode JSON response: %v", err)
+		close(release)
+	})
+
+	t.Run("remove", func(t *testing.T) {
+		if rec := post("/tasks/api/tasks/action-test/remove", ""); rec.Code != http.StatusOK {
+			t.Fatalf("remove status = %d", rec.Code)
 		}
-		if !result.OK {
-			t.Fatalf("ok = false for valid task with special name")
+		if _, err := tm.GetTask("action-test"); err == nil {
+			t.Fatal("task still exists after remove")
 		}
 	})
 }
 
-func TestWebHandlerRejectsUnexpectedRootPath(t *testing.T) {
+func TestWebHandlerSpecialTaskNames(t *testing.T) {
+	tm := New()
+	defer tm.Stop()
+	name := "weird name & task"
+	if err := tm.AddTask(name, Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+	handler := tm.WebHandler("")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks/"+url.PathEscape(name)+"/pause", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	info, err := tm.GetTask(name)
+	if err != nil {
+		t.Fatalf("GetTask() failed: %v", err)
+	}
+	if info.Enabled {
+		t.Fatal("task still enabled after pause via escaped path")
+	}
+}
+
+func TestWebHandlerPreview(t *testing.T) {
 	tm := New()
 	defer tm.Stop()
 	handler := tm.WebHandler("")
 
-	req := httptest.NewRequest(http.MethodGet, "/not-a-real-path", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
-	}
+	t.Run("valid", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/schedule/preview?expr="+url.QueryEscape("@every 90s"), nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+		}
+		var result struct {
+			OK      bool        `json:"ok"`
+			Expr    string      `json:"expr"`
+			Meaning string      `json:"meaning"`
+			Next    []time.Time `json:"next"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !result.OK || result.Expr != "@every 90s" || result.Meaning != "every 90s" || len(result.Next) != 3 {
+			t.Fatalf("unexpected preview: %+v", result)
+		}
+		gap := result.Next[1].Sub(result.Next[0])
+		if gap != 90*time.Second {
+			t.Fatalf("fire gap = %v, want 90s", gap)
+		}
+	})
+
+	t.Run("out-of-range step is rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/schedule/preview?expr="+url.QueryEscape("*/90 * * * * *"), nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "seconds step") {
+			t.Fatalf("error should mention seconds step: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("five-field is normalized", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/schedule/preview?expr="+url.QueryEscape("*/5 * * * *"), nil)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		var result struct {
+			OK   bool   `json:"ok"`
+			Expr string `json:"expr"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&result); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !result.OK || result.Expr != "0 */5 * * * *" {
+			t.Fatalf("unexpected preview: %+v", result)
+		}
+	})
 }

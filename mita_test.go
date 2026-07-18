@@ -2168,3 +2168,186 @@ func BenchmarkListTasks(b *testing.B) {
 		tm.ListTasks()
 	}
 }
+
+// TestRecentEvents verifies the event ring buffer records and orders events.
+func TestRecentEvents(t *testing.T) {
+	tm := New()
+	defer tm.Stop()
+
+	if err := tm.AddTask("evt", Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+	if err := tm.RunTaskNowAndWait(context.Background(), "evt"); err != nil {
+		t.Fatalf("RunTaskNowAndWait() failed: %v", err)
+	}
+
+	events := tm.RecentEvents(0)
+	if len(events) < 3 {
+		t.Fatalf("expected at least 3 events, got %d", len(events))
+	}
+	// newest first: completed, manual-trigger, task-added
+	if events[0].Kind != EventCompleted || events[0].TaskName != "evt" {
+		t.Fatalf("events[0] = %+v, want completed for evt", events[0])
+	}
+	if events[1].Kind != EventLifecycle || events[1].Message != "manual run triggered" {
+		t.Fatalf("events[1] = %+v, want manual trigger lifecycle", events[1])
+	}
+	if events[0].Duration < 0 {
+		t.Fatalf("completed event duration = %v, want >= 0", events[0].Duration)
+	}
+
+	if got := tm.RecentEvents(2); len(got) != 2 {
+		t.Fatalf("RecentEvents(2) returned %d events", len(got))
+	}
+}
+
+// TestSkipCountAndSkipEvents verifies skips are counted and recorded.
+func TestSkipCountAndSkipEvents(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	tm := New()
+	defer tm.Stop()
+
+	if err := tm.AddTask("skippy", Every().Minute(), func(ctx context.Context) error {
+		close(started)
+		<-release
+		return nil
+	}); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+	if _, err := tm.RunTaskNow("skippy"); err != nil {
+		t.Fatalf("RunTaskNow() failed: %v", err)
+	}
+	<-started
+	if _, err := tm.RunTaskNow("skippy"); !errors.Is(err, ErrTaskRunning) {
+		t.Fatalf("second RunTaskNow() error = %v, want ErrTaskRunning", err)
+	}
+	close(release)
+
+	info, err := tm.GetTask("skippy")
+	if err != nil {
+		t.Fatalf("GetTask() failed: %v", err)
+	}
+	if info.SkipCount != 1 {
+		t.Fatalf("SkipCount = %d, want 1", info.SkipCount)
+	}
+	if tm.Stats().TotalSkips != 1 {
+		t.Fatalf("Stats().TotalSkips = %d, want 1", tm.Stats().TotalSkips)
+	}
+
+	foundSkip := false
+	for _, ev := range tm.RecentEvents(0) {
+		if ev.Kind == EventSkipped && ev.TaskName == "skippy" {
+			foundSkip = true
+		}
+	}
+	if !foundSkip {
+		t.Fatal("skip event not recorded")
+	}
+}
+
+// TestUpcomingRuns verifies bulk next-fire computation.
+func TestUpcomingRuns(t *testing.T) {
+	tm := New()
+	defer tm.Stop()
+
+	if err := tm.AddTask("fast", Every().Seconds(10), func(ctx context.Context) error { return nil }); err != nil {
+		t.Fatalf("AddTask(fast) failed: %v", err)
+	}
+	if err := tm.AddTask("slow", Every().Day().At(2, 0), func(ctx context.Context) error { return nil }); err != nil {
+		t.Fatalf("AddTask(slow) failed: %v", err)
+	}
+	if err := tm.AddTask("off", Every().Seconds(10), func(ctx context.Context) error { return nil }); err != nil {
+		t.Fatalf("AddTask(off) failed: %v", err)
+	}
+	if err := tm.DisableTask("off"); err != nil {
+		t.Fatalf("DisableTask() failed: %v", err)
+	}
+
+	runs := tm.UpcomingRuns(time.Minute, 0)
+	if n := len(runs["fast"]); n < 5 || n > 7 {
+		t.Fatalf("fast upcoming = %d fires in 1m, want ~6", n)
+	}
+	for i := 1; i < len(runs["fast"]); i++ {
+		if !runs["fast"][i].After(runs["fast"][i-1]) {
+			t.Fatal("upcoming fires not strictly increasing")
+		}
+	}
+	if len(runs["slow"]) != 0 {
+		t.Fatalf("slow upcoming = %d fires in 1m, want 0", len(runs["slow"]))
+	}
+	if runs["off"] != nil {
+		t.Fatalf("disabled task upcoming = %v, want nil", runs["off"])
+	}
+
+	capped := tm.UpcomingRuns(time.Hour, 3)
+	if len(capped["fast"]) != 3 {
+		t.Fatalf("perTaskLimit not honored: %d fires", len(capped["fast"]))
+	}
+}
+
+// TestPreviewSchedule verifies validation and next-fire preview.
+func TestPreviewSchedule(t *testing.T) {
+	tm := New()
+	defer tm.Stop()
+
+	expr, fires, err := tm.PreviewSchedule(Cron("*/5 * * * *"), 3)
+	if err != nil {
+		t.Fatalf("PreviewSchedule() failed: %v", err)
+	}
+	if expr != "0 */5 * * * *" {
+		t.Fatalf("normalized expr = %q, want %q", expr, "0 */5 * * * *")
+	}
+	if len(fires) != 3 {
+		t.Fatalf("fires = %d, want 3", len(fires))
+	}
+	if gap := fires[1].Sub(fires[0]); gap != 5*time.Minute {
+		t.Fatalf("fire gap = %v, want 5m", gap)
+	}
+
+	if _, _, err := tm.PreviewSchedule(Cron("*/90 * * * * *"), 3); err == nil {
+		t.Fatal("PreviewSchedule() accepted an out-of-range step")
+	}
+	if _, _, err := tm.PreviewSchedule(Cron("garbage"), 3); err == nil {
+		t.Fatal("PreviewSchedule() accepted garbage")
+	}
+	if _, _, err := tm.PreviewSchedule(nil, 3); err == nil {
+		t.Fatal("PreviewSchedule() accepted nil schedule")
+	}
+}
+
+// TestRawCronStepValidation verifies AddTask rejects out-of-range raw-cron steps.
+func TestRawCronStepValidation(t *testing.T) {
+	tm := New()
+	defer tm.Stop()
+
+	task := func(ctx context.Context) error { return nil }
+	if err := tm.AddTask("bad-sec", Cron("*/90 * * * * *"), task); err == nil {
+		t.Fatal("AddTask() accepted */90 seconds step")
+	}
+	if err := tm.AddTask("bad-min", Cron("0 */75 * * * *"), task); err == nil {
+		t.Fatal("AddTask() accepted */75 minutes step")
+	}
+	if err := tm.AddTask("bad-hour", Cron("0 0 */30 * * *"), task); err == nil {
+		t.Fatal("AddTask() accepted */30 hours step")
+	}
+	if err := tm.AddTask("good", Cron("*/30 * * * * *"), task); err != nil {
+		t.Fatalf("AddTask() rejected a valid step: %v", err)
+	}
+}
+
+// TestStatsStartedAt verifies the started timestamp is exposed.
+func TestStatsStartedAt(t *testing.T) {
+	tm := New()
+	defer tm.Stop()
+
+	if !tm.Stats().StartedAt.IsZero() {
+		t.Fatal("StartedAt should be zero before Start")
+	}
+	if err := tm.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	if tm.Stats().StartedAt.IsZero() {
+		t.Fatal("StartedAt should be set after Start")
+	}
+}
