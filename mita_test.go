@@ -24,7 +24,8 @@ func TestNew(t *testing.T) {
 			name: "default configuration",
 			opts: nil,
 			want: func(tm *TaskManager) bool {
-				return tm != nil && !tm.IsRunning() && tm.maxConcurrent == 0 && !tm.allowOverlapping
+				return tm != nil && !tm.IsStarted() && tm.maxConcurrent == 0 &&
+					!tm.allowOverlapping && tm.shutdownTimeout == DefaultShutdownTimeout
 			},
 		},
 		{
@@ -46,6 +47,20 @@ func TestNew(t *testing.T) {
 			opts: []Option{WithAllowOverlapping(true)},
 			want: func(tm *TaskManager) bool {
 				return tm.allowOverlapping
+			},
+		},
+		{
+			name: "with shutdown timeout",
+			opts: []Option{WithShutdownTimeout(5 * time.Second)},
+			want: func(tm *TaskManager) bool {
+				return tm.shutdownTimeout == 5*time.Second
+			},
+		},
+		{
+			name: "with non-positive shutdown timeout ignored",
+			opts: []Option{WithShutdownTimeout(0)},
+			want: func(tm *TaskManager) bool {
+				return tm.shutdownTimeout == DefaultShutdownTimeout
 			},
 		},
 		{
@@ -80,7 +95,7 @@ func TestNew(t *testing.T) {
 			name: "with location",
 			opts: []Option{WithLocation(time.UTC)},
 			want: func(tm *TaskManager) bool {
-				return tm.cron != nil
+				return tm.cron != nil && tm.location == time.UTC
 			},
 		},
 	}
@@ -141,6 +156,27 @@ func TestAddTask(t *testing.T) {
 			task:      func(ctx context.Context) error { return nil },
 			wantError: true,
 		},
+		{
+			name:      "standard 5-field cron expression",
+			taskName:  "test-task",
+			schedule:  Cron("*/5 * * * *"),
+			task:      func(ctx context.Context) error { return nil },
+			wantError: false,
+		},
+		{
+			name:      "descriptor expression",
+			taskName:  "test-task",
+			schedule:  Cron("@every 90s"),
+			task:      func(ctx context.Context) error { return nil },
+			wantError: false,
+		},
+		{
+			name:      "builder with invalid interval",
+			taskName:  "test-task",
+			schedule:  Every().Seconds(90),
+			task:      func(ctx context.Context) error { return nil },
+			wantError: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -166,6 +202,24 @@ func TestAddTask(t *testing.T) {
 	}
 }
 
+// TestFiveFieldCronNormalization verifies 5-field expressions gain a seconds column.
+func TestFiveFieldCronNormalization(t *testing.T) {
+	tm := New()
+	defer tm.Stop()
+
+	if err := tm.AddTask("five-field", Cron("*/5 * * * *"), func(ctx context.Context) error { return nil }); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+
+	info, err := tm.GetTask("five-field")
+	if err != nil {
+		t.Fatalf("GetTask() failed: %v", err)
+	}
+	if info.Schedule != "0 */5 * * * *" {
+		t.Fatalf("Schedule = %q, want %q", info.Schedule, "0 */5 * * * *")
+	}
+}
+
 // TestAddDuplicateTask verifies duplicate task prevention
 func TestAddDuplicateTask(t *testing.T) {
 	tm := New()
@@ -180,8 +234,8 @@ func TestAddDuplicateTask(t *testing.T) {
 	}
 
 	err = tm.AddTask("duplicate", schedule, task)
-	if err == nil {
-		t.Error("Expected error when adding duplicate task, got nil")
+	if !errors.Is(err, ErrTaskExists) {
+		t.Errorf("AddTask() error = %v, want ErrTaskExists", err)
 	}
 }
 
@@ -263,16 +317,49 @@ func TestRunTaskNow(t *testing.T) {
 		t.Fatalf("AddTask() failed: %v", err)
 	}
 
-	err = tm.RunTaskNow("manual")
+	done, err := tm.RunTaskNow("manual")
 	if err != nil {
 		t.Fatalf("RunTaskNow() failed: %v", err)
 	}
 
-	// Wait for execution
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("task returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("task did not complete")
+	}
 
 	if !executed.Load() {
 		t.Error("Task was not executed")
+	}
+}
+
+// TestRunTaskNowDoneChannel verifies the result channel reports task errors.
+func TestRunTaskNowDoneChannel(t *testing.T) {
+	tm := New()
+	defer tm.Stop()
+
+	expectedErr := errors.New("task failed")
+	if err := tm.AddTask("channel-err", Every().Minute(), func(ctx context.Context) error {
+		return expectedErr
+	}); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+
+	done, err := tm.RunTaskNow("channel-err")
+	if err != nil {
+		t.Fatalf("RunTaskNow() failed: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, expectedErr) {
+			t.Fatalf("done channel error = %v, want %v", err, expectedErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("done channel did not receive a result")
 	}
 }
 
@@ -299,8 +386,8 @@ func TestRunTaskNowAndWait(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask() failed: %v", err)
 	}
-	if info.RunCount != 1 || info.Running || info.RunningCount != 0 {
-		t.Fatalf("task state = RunCount=%d Running=%v RunningCount=%d, want 1/false/0", info.RunCount, info.Running, info.RunningCount)
+	if info.RunCount != 1 || info.Running() || info.RunningCount != 0 {
+		t.Fatalf("task state = RunCount=%d Running=%v RunningCount=%d, want 1/false/0", info.RunCount, info.Running(), info.RunningCount)
 	}
 }
 
@@ -444,21 +531,6 @@ func TestRunTaskNowAndWaitAdmissionErrors(t *testing.T) {
 		}
 	})
 
-	t.Run("disabled task", func(t *testing.T) {
-		tm := New()
-		defer tm.Stop()
-		if err := tm.AddTask("disabled", Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
-			t.Fatalf("AddTask() failed: %v", err)
-		}
-		if err := tm.DisableTask("disabled"); err != nil {
-			t.Fatalf("DisableTask() failed: %v", err)
-		}
-		err := tm.RunTaskNowAndWait(context.Background(), "disabled")
-		if !errors.Is(err, ErrTaskDisabled) {
-			t.Fatalf("RunTaskNowAndWait() error = %v, want ErrTaskDisabled", err)
-		}
-	})
-
 	t.Run("already running", func(t *testing.T) {
 		started := make(chan struct{})
 		release := make(chan struct{})
@@ -471,7 +543,7 @@ func TestRunTaskNowAndWaitAdmissionErrors(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("AddTask() failed: %v", err)
 		}
-		if err := tm.RunTaskNow("running"); err != nil {
+		if _, err := tm.RunTaskNow("running"); err != nil {
 			t.Fatalf("RunTaskNow() failed: %v", err)
 		}
 		<-started
@@ -498,7 +570,7 @@ func TestRunTaskNowAndWaitAdmissionErrors(t *testing.T) {
 		if err := tm.AddTask("second", Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
 			t.Fatalf("AddTask(second) failed: %v", err)
 		}
-		if err := tm.RunTaskNow("first"); err != nil {
+		if _, err := tm.RunTaskNow("first"); err != nil {
 			t.Fatalf("RunTaskNow(first) failed: %v", err)
 		}
 		<-started
@@ -509,6 +581,45 @@ func TestRunTaskNowAndWaitAdmissionErrors(t *testing.T) {
 		}
 		close(release)
 	})
+}
+
+// TestManualRunAllowedOnDisabledTask verifies that disabling a task pauses its
+// schedule but keeps explicit manual triggers working.
+func TestManualRunAllowedOnDisabledTask(t *testing.T) {
+	tm := New()
+	defer tm.Stop()
+
+	var executed atomic.Int32
+	if err := tm.AddTask("disabled", Every().Minute(), func(ctx context.Context) error {
+		executed.Add(1)
+		return nil
+	}); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+	if err := tm.DisableTask("disabled"); err != nil {
+		t.Fatalf("DisableTask() failed: %v", err)
+	}
+
+	if err := tm.RunTaskNowAndWait(context.Background(), "disabled"); err != nil {
+		t.Fatalf("RunTaskNowAndWait() on disabled task failed: %v", err)
+	}
+
+	done, err := tm.RunTaskNow("disabled")
+	if err != nil {
+		t.Fatalf("RunTaskNow() on disabled task failed: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("manual run returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("manual run did not complete")
+	}
+
+	if executed.Load() != 2 {
+		t.Fatalf("executed %d times, want 2", executed.Load())
+	}
 }
 
 func TestRunTaskNowAndWaitHookPanicsDoNotPropagate(t *testing.T) {
@@ -534,7 +645,7 @@ func TestRunTaskNowAndWaitHookPanicsDoNotPropagate(t *testing.T) {
 }
 
 func TestRunTaskNowAndWaitStopCancelsTask(t *testing.T) {
-	tm := New()
+	tm := New(WithShutdownTimeout(100 * time.Millisecond))
 	started := make(chan struct{})
 	errCh := make(chan error, 1)
 
@@ -550,7 +661,9 @@ func TestRunTaskNowAndWaitStopCancelsTask(t *testing.T) {
 		errCh <- tm.RunTaskNowAndWait(context.Background(), "stop-wait")
 	}()
 	<-started
-	tm.Stop()
+	if err := tm.Stop(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop() error = %v, want context.DeadlineExceeded", err)
+	}
 
 	select {
 	case err := <-errCh:
@@ -583,13 +696,13 @@ func TestRunTaskNowErrors(t *testing.T) {
 			wantError: true,
 		},
 		{
-			name: "disabled task",
+			name: "disabled task is allowed",
 			setup: func(tm *TaskManager) {
 				tm.AddTask("disabled", Every().Minute(), func(ctx context.Context) error { return nil })
 				tm.DisableTask("disabled")
 			},
 			taskName:  "disabled",
-			wantError: true,
+			wantError: false,
 		},
 	}
 
@@ -599,7 +712,7 @@ func TestRunTaskNowErrors(t *testing.T) {
 			defer tm.Stop()
 			tt.setup(tm)
 
-			err := tm.RunTaskNow(tt.taskName)
+			_, err := tm.RunTaskNow(tt.taskName)
 			if (err != nil) != tt.wantError {
 				t.Errorf("RunTaskNow() error = %v, wantError %v", err, tt.wantError)
 			}
@@ -608,22 +721,6 @@ func TestRunTaskNowErrors(t *testing.T) {
 }
 
 func TestRunTaskNowReturnsSentinelErrors(t *testing.T) {
-	t.Run("disabled task", func(t *testing.T) {
-		tm := New()
-		defer tm.Stop()
-		if err := tm.AddTask("disabled", Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
-			t.Fatalf("AddTask() failed: %v", err)
-		}
-		if err := tm.DisableTask("disabled"); err != nil {
-			t.Fatalf("DisableTask() failed: %v", err)
-		}
-
-		err := tm.RunTaskNow("disabled")
-		if !errors.Is(err, ErrTaskDisabled) {
-			t.Fatalf("RunTaskNow() error = %v, want ErrTaskDisabled", err)
-		}
-	})
-
 	t.Run("already running", func(t *testing.T) {
 		started := make(chan struct{})
 		release := make(chan struct{})
@@ -636,12 +733,12 @@ func TestRunTaskNowReturnsSentinelErrors(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("AddTask() failed: %v", err)
 		}
-		if err := tm.RunTaskNow("running"); err != nil {
+		if _, err := tm.RunTaskNow("running"); err != nil {
 			t.Fatalf("RunTaskNow() failed: %v", err)
 		}
 		<-started
 
-		err := tm.RunTaskNow("running")
+		_, err := tm.RunTaskNow("running")
 		if !errors.Is(err, ErrTaskRunning) {
 			t.Fatalf("RunTaskNow() error = %v, want ErrTaskRunning", err)
 		}
@@ -663,12 +760,12 @@ func TestRunTaskNowReturnsSentinelErrors(t *testing.T) {
 		if err := tm.AddTask("second", Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
 			t.Fatalf("AddTask(second) failed: %v", err)
 		}
-		if err := tm.RunTaskNow("first"); err != nil {
+		if _, err := tm.RunTaskNow("first"); err != nil {
 			t.Fatalf("RunTaskNow(first) failed: %v", err)
 		}
 		<-started
 
-		err := tm.RunTaskNow("second")
+		_, err := tm.RunTaskNow("second")
 		if !errors.Is(err, ErrMaxConcurrencyReached) {
 			t.Fatalf("RunTaskNow(second) error = %v, want ErrMaxConcurrencyReached", err)
 		}
@@ -683,7 +780,7 @@ func TestRunTaskNowReturnsSentinelErrors(t *testing.T) {
 	})
 }
 
-func TestRunTaskNowSkipDoesNotFireHooks(t *testing.T) {
+func TestRunTaskNowSkipDoesNotFireStartCompleteHooks(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var skippedStarts atomic.Int32
@@ -714,12 +811,12 @@ func TestRunTaskNowSkipDoesNotFireHooks(t *testing.T) {
 	if err := tm.AddTask("skipped", Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
 		t.Fatalf("AddTask(skipped) failed: %v", err)
 	}
-	if err := tm.RunTaskNow("holder"); err != nil {
+	if _, err := tm.RunTaskNow("holder"); err != nil {
 		t.Fatalf("RunTaskNow(holder) failed: %v", err)
 	}
 	<-started
 
-	err := tm.RunTaskNow("skipped")
+	_, err := tm.RunTaskNow("skipped")
 	if !errors.Is(err, ErrMaxConcurrencyReached) {
 		t.Fatalf("RunTaskNow(skipped) error = %v, want ErrMaxConcurrencyReached", err)
 	}
@@ -732,9 +829,50 @@ func TestRunTaskNowSkipDoesNotFireHooks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask(skipped) failed: %v", err)
 	}
-	if info.RunCount != 0 || info.Running || info.RunningCount != 0 {
-		t.Fatalf("skipped task state = RunCount=%d Running=%v RunningCount=%d", info.RunCount, info.Running, info.RunningCount)
+	if info.RunCount != 0 || info.Running() || info.RunningCount != 0 {
+		t.Fatalf("skipped task state = RunCount=%d Running=%v RunningCount=%d", info.RunCount, info.Running(), info.RunningCount)
 	}
+}
+
+// TestOnTaskSkipHook verifies the skip hook fires with the skip reason.
+func TestOnTaskSkipHook(t *testing.T) {
+	skips := make(chan TaskSkipEvent, 4)
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	tm := New(WithOnTaskSkip(func(event TaskSkipEvent) {
+		skips <- event
+	}))
+	defer tm.Stop()
+
+	if err := tm.AddTask("busy", Every().Minute(), func(ctx context.Context) error {
+		close(started)
+		<-release
+		return nil
+	}); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+	if _, err := tm.RunTaskNow("busy"); err != nil {
+		t.Fatalf("RunTaskNow() failed: %v", err)
+	}
+	<-started
+
+	if _, err := tm.RunTaskNow("busy"); !errors.Is(err, ErrTaskRunning) {
+		t.Fatalf("RunTaskNow() error = %v, want ErrTaskRunning", err)
+	}
+
+	select {
+	case event := <-skips:
+		if event.TaskName != "busy" || event.Trigger != TriggerManual || !errors.Is(event.Reason, ErrTaskRunning) {
+			t.Fatalf("unexpected skip event: %+v", event)
+		}
+		if event.SkippedAt.IsZero() {
+			t.Fatal("skip event has zero SkippedAt")
+		}
+	default:
+		t.Fatal("OnTaskSkip was not called")
+	}
+	close(release)
 }
 
 // TestDisableEnableTask verifies task enable/disable functionality
@@ -800,20 +938,101 @@ func TestRemoveTask(t *testing.T) {
 	}
 
 	_, err = tm.GetTask("removable")
-	if err == nil {
-		t.Error("Expected error getting removed task, got nil")
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Errorf("GetTask() error = %v, want ErrTaskNotFound", err)
 	}
 
 	// Test removing non-existent task
 	err = tm.RemoveTask("non-existent")
-	if err == nil {
-		t.Error("Expected error removing non-existent task, got nil")
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Errorf("RemoveTask() error = %v, want ErrTaskNotFound", err)
 	}
 
 	// Test removing with empty name
 	err = tm.RemoveTask("")
 	if err == nil {
 		t.Error("Expected error removing task with empty name, got nil")
+	}
+}
+
+// TestUpdateSchedule verifies schedule updates preserve task state.
+func TestUpdateSchedule(t *testing.T) {
+	tm := New()
+	defer tm.Stop()
+
+	if err := tm.AddTask("reschedule", Cron("0 0 0 1 1 *"), func(ctx context.Context) error { return nil }); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+	if err := tm.RunTaskNowAndWait(context.Background(), "reschedule"); err != nil {
+		t.Fatalf("RunTaskNowAndWait() failed: %v", err)
+	}
+
+	if err := tm.UpdateSchedule("reschedule", Every().Seconds(5)); err != nil {
+		t.Fatalf("UpdateSchedule() failed: %v", err)
+	}
+
+	info, err := tm.GetTask("reschedule")
+	if err != nil {
+		t.Fatalf("GetTask() failed: %v", err)
+	}
+	if info.Schedule != "*/5 * * * * *" {
+		t.Fatalf("Schedule = %q, want %q", info.Schedule, "*/5 * * * * *")
+	}
+	if info.RunCount != 1 {
+		t.Fatalf("RunCount = %d, want 1 (statistics must be preserved)", info.RunCount)
+	}
+
+	t.Run("invalid schedule leaves task unchanged", func(t *testing.T) {
+		if err := tm.UpdateSchedule("reschedule", Cron("garbage")); err == nil {
+			t.Fatal("UpdateSchedule() accepted an invalid schedule")
+		}
+		if err := tm.UpdateSchedule("reschedule", Every().Seconds(90)); err == nil {
+			t.Fatal("UpdateSchedule() accepted an invalid builder")
+		}
+		info, err := tm.GetTask("reschedule")
+		if err != nil {
+			t.Fatalf("GetTask() failed: %v", err)
+		}
+		if info.Schedule != "*/5 * * * * *" {
+			t.Fatalf("Schedule = %q, want unchanged %q", info.Schedule, "*/5 * * * * *")
+		}
+	})
+
+	t.Run("unknown task", func(t *testing.T) {
+		if err := tm.UpdateSchedule("nope", Every().Minute()); !errors.Is(err, ErrTaskNotFound) {
+			t.Fatalf("UpdateSchedule() error = %v, want ErrTaskNotFound", err)
+		}
+	})
+
+	t.Run("nil schedule", func(t *testing.T) {
+		if err := tm.UpdateSchedule("reschedule", nil); err == nil {
+			t.Fatal("UpdateSchedule() accepted a nil schedule")
+		}
+	})
+}
+
+// TestUpdateScheduleTakesEffect verifies the new schedule actually drives execution.
+func TestUpdateScheduleTakesEffect(t *testing.T) {
+	tm := New()
+	tm.Start()
+	defer tm.Stop()
+
+	var counter atomic.Int32
+	// Far-future schedule: never fires during the test.
+	if err := tm.AddTask("dormant", Cron("0 0 0 1 1 *"), func(ctx context.Context) error {
+		counter.Add(1)
+		return nil
+	}); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+
+	if err := tm.UpdateSchedule("dormant", Every().Second()); err != nil {
+		t.Fatalf("UpdateSchedule() failed: %v", err)
+	}
+
+	time.Sleep(2500 * time.Millisecond)
+	if counter.Load() < 2 {
+		t.Fatalf("task executed %d times after reschedule, expected at least 2", counter.Load())
 	}
 }
 
@@ -824,7 +1043,8 @@ func TestListTasks(t *testing.T) {
 
 	task := func(ctx context.Context) error { return nil }
 
-	names := []string{"task1", "task2", "task3"}
+	// Added out of order to verify sorting.
+	names := []string{"task3", "task1", "task2"}
 	for _, name := range names {
 		err := tm.AddTask(name, Every().Minute(), task)
 		if err != nil {
@@ -834,18 +1054,13 @@ func TestListTasks(t *testing.T) {
 
 	tasks := tm.ListTasks()
 	if len(tasks) != len(names) {
-		t.Errorf("ListTasks() returned %d tasks, want %d", len(tasks), len(names))
+		t.Fatalf("ListTasks() returned %d tasks, want %d", len(tasks), len(names))
 	}
 
-	// Verify all tasks are present
-	taskMap := make(map[string]bool)
-	for _, info := range tasks {
-		taskMap[info.Name] = true
-	}
-
-	for _, name := range names {
-		if !taskMap[name] {
-			t.Errorf("Task %s not found in list", name)
+	// ListTasks returns tasks sorted by name.
+	for i, want := range []string{"task1", "task2", "task3"} {
+		if tasks[i].Name != want {
+			t.Errorf("tasks[%d].Name = %s, want %s", i, tasks[i].Name, want)
 		}
 	}
 }
@@ -898,6 +1113,7 @@ func TestScheduledTaskSkipsWhenMaxConcurrentReached(t *testing.T) {
 	releaseHolder := make(chan struct{})
 	var scheduledStarts atomic.Int32
 	var scheduledCompletes atomic.Int32
+	var scheduledSkips atomic.Int32
 
 	tm := New(
 		WithMaxConcurrent(1),
@@ -909,6 +1125,11 @@ func TestScheduledTaskSkipsWhenMaxConcurrentReached(t *testing.T) {
 		WithOnTaskComplete(func(event TaskCompleteEvent) {
 			if event.TaskName == "scheduled-skip" {
 				scheduledCompletes.Add(1)
+			}
+		}),
+		WithOnTaskSkip(func(event TaskSkipEvent) {
+			if event.TaskName == "scheduled-skip" && errors.Is(event.Reason, ErrMaxConcurrencyReached) {
+				scheduledSkips.Add(1)
 			}
 		}),
 	)
@@ -926,7 +1147,7 @@ func TestScheduledTaskSkipsWhenMaxConcurrentReached(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AddTask(scheduled-skip) failed: %v", err)
 	}
-	if err := tm.RunTaskNow("holder"); err != nil {
+	if _, err := tm.RunTaskNow("holder"); err != nil {
 		t.Fatalf("RunTaskNow(holder) failed: %v", err)
 	}
 	<-holderStarted
@@ -938,11 +1159,14 @@ func TestScheduledTaskSkipsWhenMaxConcurrentReached(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask(scheduled-skip) failed: %v", err)
 	}
-	if info.RunCount != 0 || info.Running || info.RunningCount != 0 {
-		t.Fatalf("scheduled skipped task state = RunCount=%d Running=%v RunningCount=%d", info.RunCount, info.Running, info.RunningCount)
+	if info.RunCount != 0 || info.Running() || info.RunningCount != 0 {
+		t.Fatalf("scheduled skipped task state = RunCount=%d Running=%v RunningCount=%d", info.RunCount, info.Running(), info.RunningCount)
 	}
 	if scheduledStarts.Load() != 0 || scheduledCompletes.Load() != 0 {
 		t.Fatalf("scheduled skipped hooks fired: starts=%d completes=%d", scheduledStarts.Load(), scheduledCompletes.Load())
+	}
+	if scheduledSkips.Load() == 0 {
+		t.Fatal("OnTaskSkip was not called for scheduled skip")
 	}
 	close(releaseHolder)
 }
@@ -1011,6 +1235,97 @@ func TestAllowOverlapping(t *testing.T) {
 	}
 }
 
+// TestPerTaskOverlappingOverride verifies WithTaskOverlapping wins over the manager default.
+func TestPerTaskOverlappingOverride(t *testing.T) {
+	t.Run("task allows overlap despite manager default", func(t *testing.T) {
+		started := make(chan struct{}, 2)
+		release := make(chan struct{})
+		tm := New(WithAllowOverlapping(false))
+		defer tm.Stop()
+
+		if err := tm.AddTask("overlap-ok", Every().Minute(), func(ctx context.Context) error {
+			started <- struct{}{}
+			<-release
+			return nil
+		}, WithTaskOverlapping(true)); err != nil {
+			t.Fatalf("AddTask() failed: %v", err)
+		}
+
+		if _, err := tm.RunTaskNow("overlap-ok"); err != nil {
+			t.Fatalf("first RunTaskNow() failed: %v", err)
+		}
+		if _, err := tm.RunTaskNow("overlap-ok"); err != nil {
+			t.Fatalf("second RunTaskNow() failed: %v", err)
+		}
+		for i := 0; i < 2; i++ {
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("overlapping instance did not start")
+			}
+		}
+		close(release)
+	})
+
+	t.Run("task forbids overlap despite manager default", func(t *testing.T) {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		tm := New(WithAllowOverlapping(true))
+		defer tm.Stop()
+
+		if err := tm.AddTask("no-overlap", Every().Minute(), func(ctx context.Context) error {
+			close(started)
+			<-release
+			return nil
+		}, WithTaskOverlapping(false)); err != nil {
+			t.Fatalf("AddTask() failed: %v", err)
+		}
+
+		if _, err := tm.RunTaskNow("no-overlap"); err != nil {
+			t.Fatalf("first RunTaskNow() failed: %v", err)
+		}
+		<-started
+		if _, err := tm.RunTaskNow("no-overlap"); !errors.Is(err, ErrTaskRunning) {
+			t.Fatalf("second RunTaskNow() error = %v, want ErrTaskRunning", err)
+		}
+		close(release)
+	})
+}
+
+// TestPerTaskTimeout verifies WithTaskTimeout cancels the task context.
+func TestPerTaskTimeout(t *testing.T) {
+	tm := New()
+	defer tm.Stop()
+
+	if err := tm.AddTask("slow", Every().Minute(), func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			return nil
+		}
+	}, WithTaskTimeout(100*time.Millisecond)); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+
+	start := time.Now()
+	err := tm.RunTaskNowAndWait(context.Background(), "slow")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RunTaskNowAndWait() error = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("task took %v, timeout did not kick in", elapsed)
+	}
+
+	info, err := tm.GetTask("slow")
+	if err != nil {
+		t.Fatalf("GetTask() failed: %v", err)
+	}
+	if info.ErrorCount != 1 {
+		t.Fatalf("ErrorCount = %d, want 1", info.ErrorCount)
+	}
+}
+
 func TestRunningCountWithOverlappingExecutions(t *testing.T) {
 	started := make(chan struct{}, 2)
 	release := make(chan struct{})
@@ -1028,10 +1343,10 @@ func TestRunningCountWithOverlappingExecutions(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AddTask() failed: %v", err)
 	}
-	if err := tm.RunTaskNow("overlap-count"); err != nil {
+	if _, err := tm.RunTaskNow("overlap-count"); err != nil {
 		t.Fatalf("first RunTaskNow() failed: %v", err)
 	}
-	if err := tm.RunTaskNow("overlap-count"); err != nil {
+	if _, err := tm.RunTaskNow("overlap-count"); err != nil {
 		t.Fatalf("second RunTaskNow() failed: %v", err)
 	}
 
@@ -1047,8 +1362,8 @@ func TestRunningCountWithOverlappingExecutions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask() failed: %v", err)
 	}
-	if !info.Running || info.RunningCount != 2 {
-		t.Fatalf("Running=%v RunningCount=%d, want true/2", info.Running, info.RunningCount)
+	if !info.Running() || info.RunningCount != 2 {
+		t.Fatalf("Running=%v RunningCount=%d, want true/2", info.Running(), info.RunningCount)
 	}
 
 	close(release)
@@ -1064,8 +1379,8 @@ func TestRunningCountWithOverlappingExecutions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask() failed: %v", err)
 	}
-	if info.Running || info.RunningCount != 0 {
-		t.Fatalf("Running=%v RunningCount=%d, want false/0", info.Running, info.RunningCount)
+	if info.Running() || info.RunningCount != 0 {
+		t.Fatalf("Running=%v RunningCount=%d, want false/0", info.Running(), info.RunningCount)
 	}
 }
 
@@ -1074,10 +1389,12 @@ func TestContextInjection(t *testing.T) {
 	staticValue := "static-value"
 	dynamicValue := "dynamic-value"
 
+	type dynamicKey string
+
 	tm := New(
 		WithContextValue("static-key", staticValue),
 		WithContextInjector(func(ctx context.Context, taskName string) context.Context {
-			return context.WithValue(ctx, "dynamic-key", dynamicValue)
+			return context.WithValue(ctx, dynamicKey("dynamic-key"), dynamicValue)
 		}),
 	)
 	tm.Start()
@@ -1087,10 +1404,10 @@ func TestContextInjection(t *testing.T) {
 	var done atomic.Bool
 
 	task := func(ctx context.Context) error {
-		if v, ok := ctx.Value(CtxtKey("static-key")).(string); ok {
+		if v, ok := ContextValue(ctx, "static-key").(string); ok {
 			receivedStatic = v
 		}
-		if v, ok := ctx.Value("dynamic-key").(string); ok {
+		if v, ok := ctx.Value(dynamicKey("dynamic-key")).(string); ok {
 			receivedDynamic = v
 		}
 		receivedTaskName = GetTaskName(ctx)
@@ -1121,6 +1438,33 @@ func TestContextInjection(t *testing.T) {
 	}
 }
 
+// TestTaskNameImmuneToUserContextValues verifies user values cannot shadow the
+// internal task name key.
+func TestTaskNameImmuneToUserContextValues(t *testing.T) {
+	tm := New(WithContextValue("taskName", "user-value"))
+	defer tm.Stop()
+
+	got := make(chan [2]any, 1)
+	if err := tm.AddTask("real-task", Every().Minute(), func(ctx context.Context) error {
+		got <- [2]any{GetTaskName(ctx), ContextValue(ctx, "taskName")}
+		return nil
+	}); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+
+	if err := tm.RunTaskNowAndWait(context.Background(), "real-task"); err != nil {
+		t.Fatalf("RunTaskNowAndWait() failed: %v", err)
+	}
+
+	values := <-got
+	if values[0] != "real-task" {
+		t.Errorf("GetTaskName() = %v, want real-task (must not be shadowed by user value)", values[0])
+	}
+	if values[1] != "user-value" {
+		t.Errorf("ContextValue(taskName) = %v, want user-value", values[1])
+	}
+}
+
 func TestContextValueHelper(t *testing.T) {
 	tm := New(WithContextValue("app", "demo"))
 	defer tm.Stop()
@@ -1133,7 +1477,7 @@ func TestContextValueHelper(t *testing.T) {
 		t.Fatalf("AddTask() failed: %v", err)
 	}
 
-	if err := tm.RunTaskNow("context-helper"); err != nil {
+	if _, err := tm.RunTaskNow("context-helper"); err != nil {
 		t.Fatalf("RunTaskNow() failed: %v", err)
 	}
 
@@ -1192,8 +1536,8 @@ func TestLifecycleHooks(t *testing.T) {
 			info, err := tm.GetTask(event.TaskName)
 			if err != nil {
 				t.Errorf("GetTask() in OnTaskComplete failed: %v", err)
-			} else if info.Running || info.RunningCount != 0 {
-				t.Errorf("OnTaskComplete observed running task: Running=%v RunningCount=%d", info.Running, info.RunningCount)
+			} else if info.Running() || info.RunningCount != 0 {
+				t.Errorf("OnTaskComplete observed running task: Running=%v RunningCount=%d", info.Running(), info.RunningCount)
 			}
 			completed <- event
 		}),
@@ -1208,7 +1552,7 @@ func TestLifecycleHooks(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AddTask() failed: %v", err)
 	}
-	if err := tm.RunTaskNow("hooked"); err != nil {
+	if _, err := tm.RunTaskNow("hooked"); err != nil {
 		t.Fatalf("RunTaskNow() failed: %v", err)
 	}
 
@@ -1234,6 +1578,63 @@ func TestLifecycleHooks(t *testing.T) {
 	}
 }
 
+// TestCompleteEventRunCountMatchesStartEvent verifies that with overlapping
+// executions, each completion reports its own execution's RunCount rather
+// than the latest global counter.
+func TestCompleteEventRunCountMatchesStartEvent(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan int64, 2)
+	completed := make(chan int64, 2)
+
+	tm := New(
+		WithAllowOverlapping(true),
+		WithOnTaskStart(func(event TaskStartEvent) {
+			started <- event.RunCount
+		}),
+		WithOnTaskComplete(func(event TaskCompleteEvent) {
+			completed <- event.RunCount
+		}),
+	)
+	defer tm.Stop()
+
+	if err := tm.AddTask("overlap-count", Every().Minute(), func(ctx context.Context) error {
+		<-release
+		return nil
+	}); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+
+	if _, err := tm.RunTaskNow("overlap-count"); err != nil {
+		t.Fatalf("first RunTaskNow() failed: %v", err)
+	}
+	if _, err := tm.RunTaskNow("overlap-count"); err != nil {
+		t.Fatalf("second RunTaskNow() failed: %v", err)
+	}
+
+	startCounts := map[int64]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case c := <-started:
+			startCounts[c] = true
+		case <-time.After(time.Second):
+			t.Fatal("start events not received")
+		}
+	}
+	close(release)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case c := <-completed:
+			if !startCounts[c] {
+				t.Fatalf("complete event RunCount %d does not match any start event", c)
+			}
+			delete(startCounts, c)
+		case <-time.After(time.Second):
+			t.Fatal("complete events not received")
+		}
+	}
+}
+
 func TestLifecycleHookPanicsDoNotAffectTask(t *testing.T) {
 	completed := make(chan TaskCompleteEvent, 1)
 	taskRan := make(chan struct{}, 1)
@@ -1254,7 +1655,7 @@ func TestLifecycleHookPanicsDoNotAffectTask(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AddTask() failed: %v", err)
 	}
-	if err := tm.RunTaskNow("hook-panic"); err != nil {
+	if _, err := tm.RunTaskNow("hook-panic"); err != nil {
 		t.Fatalf("RunTaskNow() failed: %v", err)
 	}
 
@@ -1285,7 +1686,7 @@ func TestTaskPanicIsRecordedAsFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AddTask() failed: %v", err)
 	}
-	if err := tm.RunTaskNow("panic-task"); err != nil {
+	if _, err := tm.RunTaskNow("panic-task"); err != nil {
 		t.Fatalf("RunTaskNow() failed: %v", err)
 	}
 
@@ -1331,7 +1732,7 @@ func TestContextInjectorPanicIsRecordedAsFailure(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("AddTask() failed: %v", err)
 	}
-	if err := tm.RunTaskNow("injector-panic"); err != nil {
+	if _, err := tm.RunTaskNow("injector-panic"); err != nil {
 		t.Fatalf("RunTaskNow() failed: %v", err)
 	}
 
@@ -1359,13 +1760,13 @@ func TestContextInjectorPanicIsRecordedAsFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask() failed: %v", err)
 	}
-	if info.Running || info.RunningCount != 0 || info.ErrorCount != 1 {
-		t.Fatalf("task state after injector panic = Running=%v RunningCount=%d ErrorCount=%d", info.Running, info.RunningCount, info.ErrorCount)
+	if info.Running() || info.RunningCount != 0 || info.ErrorCount != 1 {
+		t.Fatalf("task state after injector panic = Running=%v RunningCount=%d ErrorCount=%d", info.Running(), info.RunningCount, info.ErrorCount)
 	}
 }
 
-// TestGetStats verifies statistics collection
-func TestGetStats(t *testing.T) {
+// TestStats verifies statistics collection
+func TestStats(t *testing.T) {
 	tm := New(WithMaxConcurrent(5), WithAllowOverlapping(true))
 	tm.Start()
 	defer tm.Stop()
@@ -1393,48 +1794,48 @@ func TestGetStats(t *testing.T) {
 	// Wait for some executions
 	time.Sleep(2500 * time.Millisecond)
 
-	stats := tm.GetStats()
+	stats := tm.Stats()
 
-	if stats["total_tasks"].(int) != 2 {
-		t.Errorf("total_tasks = %v, want 2", stats["total_tasks"])
+	if stats.TotalTasks != 2 {
+		t.Errorf("TotalTasks = %v, want 2", stats.TotalTasks)
 	}
-
-	if stats["enabled_tasks"].(int) != 2 {
-		t.Errorf("enabled_tasks = %v, want 2", stats["enabled_tasks"])
+	if stats.EnabledTasks != 2 {
+		t.Errorf("EnabledTasks = %v, want 2", stats.EnabledTasks)
 	}
-
-	if stats["max_concurrent"].(int) != 5 {
-		t.Errorf("max_concurrent = %v, want 5", stats["max_concurrent"])
+	if stats.MaxConcurrent != 5 {
+		t.Errorf("MaxConcurrent = %v, want 5", stats.MaxConcurrent)
 	}
-
-	if stats["allow_overlapping"].(bool) != true {
-		t.Errorf("allow_overlapping = %v, want true", stats["allow_overlapping"])
+	if !stats.AllowOverlapping {
+		t.Errorf("AllowOverlapping = %v, want true", stats.AllowOverlapping)
 	}
-
-	totalRuns := stats["total_runs"].(int64)
-	if totalRuns < 2 {
-		t.Errorf("total_runs = %v, want >= 2", totalRuns)
+	if stats.TotalRuns < 2 {
+		t.Errorf("TotalRuns = %v, want >= 2", stats.TotalRuns)
 	}
-
-	totalErrors := stats["total_errors"].(int64)
-	if totalErrors == 0 {
+	if stats.TotalErrors == 0 {
 		t.Error("expected some errors, got 0")
 	}
 }
 
-// TestGracefulShutdown verifies graceful shutdown
+// TestGracefulShutdown verifies Stop waits for running tasks without
+// canceling their contexts when they finish within the timeout.
 func TestGracefulShutdown(t *testing.T) {
 	tm := New()
 	tm.Start()
 
 	var started atomic.Bool
 	var completed atomic.Bool
+	var canceled atomic.Bool
 
 	task := func(ctx context.Context) error {
 		started.Store(true)
-		time.Sleep(500 * time.Millisecond)
-		completed.Store(true)
-		return nil
+		select {
+		case <-ctx.Done():
+			canceled.Store(true)
+			return ctx.Err()
+		case <-time.After(500 * time.Millisecond):
+			completed.Store(true)
+			return nil
+		}
 	}
 
 	err := tm.AddTask("long-task", Every().Second(), task)
@@ -1449,64 +1850,124 @@ func TestGracefulShutdown(t *testing.T) {
 		t.Fatal("Task did not start")
 	}
 
-	// Stop should wait for task to complete
-	tm.Stop()
+	// Stop should wait for the task to complete without canceling it.
+	if err := tm.Stop(); err != nil {
+		t.Errorf("Stop() error = %v, want nil", err)
+	}
 
 	if !completed.Load() {
 		t.Error("Task was not allowed to complete during shutdown")
 	}
+	if canceled.Load() {
+		t.Error("Task context was canceled even though it finished within the timeout")
+	}
 
-	if tm.IsRunning() {
-		t.Error("TaskManager is still running after Stop()")
+	if tm.IsStarted() {
+		t.Error("TaskManager is still started after Stop()")
+	}
+}
+
+// TestStopCancelsTasksAfterTimeout verifies the second phase of shutdown:
+// tasks still running when the deadline expires get their contexts canceled.
+func TestStopCancelsTasksAfterTimeout(t *testing.T) {
+	tm := New(WithShutdownTimeout(200 * time.Millisecond))
+
+	started := make(chan struct{})
+	var sawCancel atomic.Bool
+
+	if err := tm.AddTask("stubborn", Every().Minute(), func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		sawCancel.Store(true)
+		return ctx.Err()
+	}); err != nil {
+		t.Fatalf("AddTask() failed: %v", err)
+	}
+	if _, err := tm.RunTaskNow("stubborn"); err != nil {
+		t.Fatalf("RunTaskNow() failed: %v", err)
+	}
+	<-started
+
+	err := tm.Stop()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop() error = %v, want context.DeadlineExceeded", err)
+	}
+	if !sawCancel.Load() {
+		t.Fatal("task context was not canceled after the shutdown deadline")
+	}
+}
+
+func TestStopContext(t *testing.T) {
+	tm := New()
+	tm.Start()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := tm.StopContext(ctx); err != nil {
+		t.Fatalf("StopContext() error = %v, want nil", err)
+	}
+
+	if err := tm.StopContext(context.Background()); !errors.Is(err, ErrTaskManagerStopped) {
+		t.Fatalf("second StopContext() error = %v, want ErrTaskManagerStopped", err)
 	}
 }
 
 func TestTaskManagerLifecycleIsOneWay(t *testing.T) {
 	tm := New()
-	if tm.IsRunning() {
-		t.Fatal("new TaskManager should not be running before Start")
+	if tm.IsStarted() {
+		t.Fatal("new TaskManager should not be started before Start")
 	}
-	tm.Start()
-	if !tm.IsRunning() {
-		t.Fatal("TaskManager should be running after Start")
+	if err := tm.Start(); err != nil {
+		t.Fatalf("Start() error = %v, want nil", err)
 	}
-	tm.Start()
-	if !tm.IsRunning() {
-		t.Fatal("second Start should be a no-op")
+	if !tm.IsStarted() {
+		t.Fatal("TaskManager should be started after Start")
 	}
-	tm.Stop()
-	if tm.IsRunning() {
-		t.Fatal("TaskManager should not be running after Stop")
+	if err := tm.Start(); !errors.Is(err, ErrTaskManagerStarted) {
+		t.Fatalf("second Start() error = %v, want ErrTaskManagerStarted", err)
 	}
-	tm.Stop()
+	if err := tm.Stop(); err != nil {
+		t.Fatalf("Stop() error = %v, want nil", err)
+	}
+	if tm.IsStarted() {
+		t.Fatal("TaskManager should not be started after Stop")
+	}
+	if err := tm.Stop(); !errors.Is(err, ErrTaskManagerStopped) {
+		t.Fatalf("second Stop() error = %v, want ErrTaskManagerStopped", err)
+	}
 
 	if err := tm.AddTask("after-stop", Every().Minute(), func(ctx context.Context) error { return nil }); !errors.Is(err, ErrTaskManagerStopped) {
 		t.Fatalf("AddTask() after Stop error = %v, want ErrTaskManagerStopped", err)
 	}
 
-	tm.Start()
-	if tm.IsRunning() {
+	if err := tm.Start(); !errors.Is(err, ErrTaskManagerStopped) {
+		t.Fatalf("Start() after Stop error = %v, want ErrTaskManagerStopped", err)
+	}
+	if tm.IsStarted() {
 		t.Fatal("Start after Stop should not restart the manager")
 	}
 }
 
 func TestStopBeforeStartIsTerminal(t *testing.T) {
 	tm := New()
-	tm.Stop()
-	tm.Stop()
+	if err := tm.Stop(); err != nil {
+		t.Fatalf("Stop() before Start error = %v, want nil", err)
+	}
+	if err := tm.Stop(); !errors.Is(err, ErrTaskManagerStopped) {
+		t.Fatalf("second Stop() error = %v, want ErrTaskManagerStopped", err)
+	}
 
-	if tm.IsRunning() {
-		t.Fatal("TaskManager should not be running after Stop before Start")
+	if tm.IsStarted() {
+		t.Fatal("TaskManager should not be started after Stop before Start")
 	}
 	if err := tm.AddTask("after-stop", Every().Minute(), func(ctx context.Context) error { return nil }); !errors.Is(err, ErrTaskManagerStopped) {
 		t.Fatalf("AddTask() after Stop error = %v, want ErrTaskManagerStopped", err)
 	}
-	if err := tm.RunTaskNow("after-stop"); !errors.Is(err, ErrTaskManagerStopped) {
+	if _, err := tm.RunTaskNow("after-stop"); !errors.Is(err, ErrTaskManagerStopped) {
 		t.Fatalf("RunTaskNow() after Stop error = %v, want ErrTaskManagerStopped", err)
 	}
-	tm.Start()
-	if tm.IsRunning() {
-		t.Fatal("Start after Stop before Start should not restart the manager")
+	if err := tm.Start(); !errors.Is(err, ErrTaskManagerStopped) {
+		t.Fatalf("Start() after Stop error = %v, want ErrTaskManagerStopped", err)
 	}
 }
 
@@ -1517,13 +1978,12 @@ func TestRunTaskNowAfterStop(t *testing.T) {
 	}
 	tm.Stop()
 
-	err := tm.RunTaskNow("manual")
+	_, err := tm.RunTaskNow("manual")
 	if !errors.Is(err, ErrTaskManagerStopped) {
 		t.Fatalf("RunTaskNow() after Stop error = %v, want ErrTaskManagerStopped", err)
 	}
 }
 
-// TestScheduleBuilder verifies schedule building
 // TestConcurrentOperations verifies thread-safety
 func TestConcurrentOperations(t *testing.T) {
 	tm := New()
@@ -1551,7 +2011,7 @@ func TestConcurrentOperations(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			tm.ListTasks()
-			tm.GetStats()
+			tm.Stats()
 		}()
 	}
 
@@ -1566,13 +2026,14 @@ func TestConcurrentOperations(t *testing.T) {
 			tm.DisableTask(taskName)
 			tm.EnableTask(taskName)
 			tm.GetTask(taskName)
+			tm.UpdateSchedule(taskName, Every().Hour())
 		}(i)
 	}
 
 	wg.Wait()
 }
 
-// TestTaskInfoCopy verifies that GetTask returns a copy
+// TestTaskInfoCopy verifies that GetTask returns an independent snapshot
 func TestTaskInfoCopy(t *testing.T) {
 	tm := New()
 	defer tm.Stop()
@@ -1595,9 +2056,10 @@ func TestTaskInfoCopy(t *testing.T) {
 	}
 }
 
-// TestContextCancellation verifies context cancellation handling
+// TestContextCancellation verifies tasks are canceled once the shutdown
+// deadline passes.
 func TestContextCancellation(t *testing.T) {
-	tm := New()
+	tm := New(WithShutdownTimeout(200 * time.Millisecond))
 	tm.Start()
 
 	var taskStarted atomic.Bool
@@ -1626,7 +2088,7 @@ func TestContextCancellation(t *testing.T) {
 		t.Fatal("Task did not start")
 	}
 
-	// Stop immediately
+	// Stop cancels the task after the (short) shutdown timeout
 	tm.Stop()
 
 	// Task should not complete normally
@@ -1687,4 +2149,22 @@ func BenchmarkConcurrentTasks(b *testing.B) {
 	b.StopTimer()
 
 	time.Sleep(500 * time.Millisecond)
+}
+
+// BenchmarkListTasks measures snapshot cost with many registered tasks.
+func BenchmarkListTasks(b *testing.B) {
+	tm := New()
+	defer tm.Stop()
+
+	for i := 0; i < 200; i++ {
+		if err := tm.AddTask(fmt.Sprintf("task-%d", i), Every().Minute(), func(ctx context.Context) error { return nil }); err != nil {
+			b.Fatalf("AddTask() failed: %v", err)
+		}
+	}
+	tm.Start()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tm.ListTasks()
+	}
 }

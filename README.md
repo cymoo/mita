@@ -4,15 +4,16 @@ A minimum task scheduling library for Go, built on top of cron expressions with 
 
 ## Features
 
-- 🕐 **Flexible Scheduling** - Standard cron expressions and fluent builder API
-- 🔒 **Concurrency Control** - Configurable max concurrent tasks and overlap prevention
+- 🕐 **Flexible Scheduling** - 5- or 6-field cron expressions, `@every` intervals, and a fluent builder API
+- 🔒 **Concurrency Control** - Configurable max concurrent tasks and overlap prevention (global and per task)
 - 📊 **Execution Tracking** - Automatic statistics for runs, errors, and execution status
 - 🎯 **Context Injection** - Support for both static and dynamic context value injection
-- 🔄 **Graceful Shutdown** - Waits for running tasks to complete before shutting down
+- 🔄 **Graceful Shutdown** - Waits for running tasks to finish, then cancels stragglers after a configurable timeout
 - 🚀 **Manual Triggers** - Execute tasks on-demand outside their regular schedule
-- 🎛️ **Task Management** - Full CRUD operations: enable, disable, remove tasks
+- 🎛️ **Task Management** - Full CRUD operations: enable, disable, remove, reschedule tasks
+- ⏱️ **Per-Task Options** - Execution timeout and overlap policy per task
 - 📝 **Logging** - Customizable logging output with detailed execution info
-- 🪝 **Lifecycle Hooks** - Observe task start and completion events
+- 🪝 **Lifecycle Hooks** - Observe task start, completion, and skip events
 - 🌍 **Timezone Support** - Configure task execution timezone
 - ⚡ **Second Precision** - Support for second-level scheduling granularity
 - 🛡️ **Thread-Safe** - Safe for concurrent use across multiple goroutines
@@ -51,13 +52,17 @@ func main() {
     })
     
     // Start the manager
-    tm.Start()
+    if err := tm.Start(); err != nil {
+        panic(err)
+    }
     
     // Run for a while
     time.Sleep(30 * time.Second)
     
     // Graceful shutdown
-    tm.Stop()
+    if err := tm.Stop(); err != nil {
+        fmt.Println("shutdown:", err)
+    }
 }
 ```
 
@@ -70,6 +75,7 @@ tm := mita.New(
     mita.WithLocation(location),             // Set timezone
     mita.WithMaxConcurrent(5),               // Max concurrent running tasks
     mita.WithAllowOverlapping(false),        // Prevent overlapping
+    mita.WithShutdownTimeout(10*time.Second), // How long Stop waits before canceling tasks
     mita.WithContextValue("env", "prod"),    // Inject context values
     mita.WithOnTaskStart(func(e mita.TaskStartEvent) {
         log.Printf("starting %s", e.TaskName)
@@ -78,6 +84,9 @@ tm := mita.New(
         if e.Error != nil {
             log.Printf("%s failed: %v", e.TaskName, e.Error)
         }
+    }),
+    mita.WithOnTaskSkip(func(e mita.TaskSkipEvent) {
+        log.Printf("%s skipped: %v", e.TaskName, e.Reason)
     }),
 )
 ```
@@ -99,17 +108,21 @@ mita.Every().Hour()
 // Every day
 mita.Every().Day()
 
-// Every N seconds
+// Every N seconds (1-59)
 mita.Every().Seconds(30)
 
-// Every N minutes
+// Every N minutes (1-59)
 mita.Every().Minutes(15)
 
-// Every N hours
+// Every N hours (1-23)
 mita.Every().Hours(6)
 
-// Every N days
+// Every N days (1-31)
 mita.Every().Days(2)
+
+// Exact fixed-length interval (any duration >= 1s), using "@every"
+mita.Every().Interval(90 * time.Second)
+mita.Every().Interval(4 * time.Hour)
 
 // Daily at specific time
 mita.Every().Day().At(14, 30)  // 2:30 PM daily
@@ -121,16 +134,35 @@ mita.Every().Day().At(9, 0).OnWeekday(time.Monday)  // Monday 9:00 AM
 mita.Every().Day().At(0, 0).OnDay(1)  // 1st of every month at midnight
 ```
 
+Two things to know about intervals:
+
+- `Seconds`/`Minutes`/`Hours` map to cron step expressions, which **reset at unit
+  boundaries**: `Seconds(45)` fires at `:00` and `:45` of every minute (a 15s gap).
+  Use `Interval` when you need exact fixed-length periods.
+- Out-of-range steps are rejected: cron would silently misinterpret them
+  (`*/90` in the seconds field fires every 60 seconds, not 90). Invalid builder
+  arguments are recorded and returned as an error from `AddTask` — builder
+  methods never panic. You can also check eagerly with `builder.Err()`.
+
 ### Using Raw Cron Expressions
 
 ```go
-// Format: second minute hour day month weekday
+// 6-field format: second minute hour day month weekday
 mita.Cron("0 30 * * * *")     // Every hour at 30 minutes
 mita.Cron("0 0 2 * * *")      // Daily at 2:00 AM
 mita.Cron("0 */15 * * * *")   // Every 15 minutes
-mita.Cron("0 0 0 1 * *")      // 1st of month at midnight
-mita.Cron("0 0 9 * * 1")      // Every Monday at 9:00 AM
+
+// Standard 5-field expressions also work (run at second 0)
+mita.Cron("*/15 * * * *")     // Every 15 minutes
+mita.Cron("0 9 * * 1")        // Every Monday at 9:00 AM
+
+// Descriptors
+mita.Cron("@hourly")
+mita.Cron("@every 90s")
 ```
+
+Expressions are validated when the schedule is registered with `AddTask` or
+`UpdateSchedule`.
 
 ## Configuration Options
 
@@ -164,7 +196,8 @@ tm := mita.New(mita.WithMaxConcurrent(3))
 
 ### WithAllowOverlapping
 
-Control whether the same task can run concurrently:
+Control whether the same task can run concurrently (individual tasks can
+override this with the `WithTaskOverlapping` task option):
 
 ```go
 // Prevent same task from running multiple instances
@@ -172,6 +205,15 @@ tm := mita.New(mita.WithAllowOverlapping(false))
 
 // Allow same task to run concurrently
 tm := mita.New(mita.WithAllowOverlapping(true))
+```
+
+### WithShutdownTimeout
+
+Control how long `Stop()` waits for running tasks to finish before canceling
+their contexts (default: 30 seconds):
+
+```go
+tm := mita.New(mita.WithShutdownTimeout(10 * time.Second))
 ```
 
 ### WithContextValue
@@ -201,7 +243,7 @@ tm := mita.New(
 )
 ```
 
-### WithOnTaskStart / WithOnTaskComplete
+### WithOnTaskStart / WithOnTaskComplete / WithOnTaskSkip
 
 Observe task lifecycle events:
 
@@ -217,12 +259,21 @@ tm := mita.New(
         }
         log.Printf("DONE %s after %s", e.TaskName, e.Duration)
     }),
+    mita.WithOnTaskSkip(func(e mita.TaskSkipEvent) {
+        // Reason is ErrTaskRunning or ErrMaxConcurrencyReached
+        log.Printf("SKIP %s: %v", e.TaskName, e.Reason)
+    }),
 )
 ```
 
 Hooks are synchronous and observability-only. A hook panic is recovered and logged
 so it does not affect task execution. Task panics are recovered, recorded as
 failures, and surfaced through `TaskCompleteEvent.Error`.
+
+`OnTaskSkip` fires when an execution is rejected by overlap prevention or the
+concurrency limit — often exactly the situations you want to alert on.
+Executions of disabled tasks are considered paused, not skipped, and do not
+fire this hook.
 
 ## Task Management
 
@@ -238,20 +289,61 @@ if err != nil {
 }
 ```
 
+Adding a task with an existing name returns `ErrTaskExists`.
+
+Per-task options can be appended:
+
+```go
+err := tm.AddTask("sync", mita.Every().Minutes(5), syncTask,
+    mita.WithTaskTimeout(2*time.Minute),   // cancel the task context after 2 minutes
+    mita.WithTaskOverlapping(true),        // override the manager-level overlap setting
+)
+```
+
+`WithTaskTimeout` cancels the task's context when the timeout elapses; the task
+must honor `ctx.Done()` for the timeout to take effect.
+
+### Updating Schedules
+
+Change a task's schedule in place — statistics and settings are preserved and
+the new schedule takes effect immediately:
+
+```go
+err := tm.UpdateSchedule("backup", mita.Every().Day().At(3, 30))
+```
+
+An invalid schedule leaves the existing one untouched.
+
 ### Manual Execution
 
 Trigger a task immediately outside its schedule:
 
 ```go
-err := tm.RunTaskNow("backup")
+done, err := tm.RunTaskNow("backup")
 if err != nil {
     log.Printf("Manual trigger failed: %v", err)
 }
 ```
 
-`RunTaskNow` returns before the task finishes. It reports submission errors such
-as `ErrTaskDisabled`, `ErrTaskRunning`, `ErrMaxConcurrencyReached`, and
-`ErrTaskManagerStopped`; use `errors.Is` to check them.
+`RunTaskNow` returns after the execution is admitted, before the task finishes.
+It reports submission errors such as `ErrTaskRunning`,
+`ErrMaxConcurrencyReached`, and `ErrTaskManagerStopped`; use `errors.Is` to
+check them. Disabled tasks **can** be triggered manually — disabling only
+pauses the schedule.
+
+The returned channel receives the task's result exactly once and can be ignored
+for fire-and-forget triggers, or consumed to join the execution later:
+
+```go
+done, err := tm.RunTaskNow("backup")
+if err != nil {
+    return err
+}
+// ... do other work ...
+if err := <-done; err != nil {
+    log.Printf("backup failed: %v", err)
+}
+```
 
 Use `RunTaskNowAndWait` when the caller should block until the task completes:
 
@@ -271,7 +363,8 @@ toward `RunCount` and, when the task returns the context error, `ErrorCount`.
 
 ### Disabling Tasks
 
-Temporarily disable a task without removing it:
+Temporarily pause a task's schedule without removing it (manual triggers still
+work while a task is disabled):
 
 ```go
 err := tm.DisableTask("backup")
@@ -297,6 +390,8 @@ err := tm.RemoveTask("backup")
 
 Get information about a specific task:
 
+`GetTask` returns an immutable `TaskInfo` snapshot:
+
 ```go
 taskInfo, err := tm.GetTask("backup")
 if err == nil {
@@ -307,12 +402,12 @@ if err == nil {
     fmt.Printf("Last Run: %s\n", taskInfo.LastRun)
     fmt.Printf("Next Run: %s\n", taskInfo.NextRun)
     fmt.Printf("Enabled: %v\n", taskInfo.Enabled)
-    fmt.Printf("Running: %v\n", taskInfo.Running)
+    fmt.Printf("Running: %v\n", taskInfo.Running())
     fmt.Printf("Running Count: %d\n", taskInfo.RunningCount)
 }
 ```
 
-List all tasks:
+List all tasks (sorted by name):
 
 ```go
 tasks := tm.ListTasks()
@@ -324,17 +419,17 @@ for _, task := range tasks {
 
 ### Statistics
 
-Get aggregated statistics:
+Get aggregated statistics as a typed struct:
 
 ```go
-stats := tm.GetStats()
-fmt.Printf("Total Tasks: %v\n", stats["total_tasks"])
-fmt.Printf("Enabled Tasks: %v\n", stats["enabled_tasks"])
-fmt.Printf("Running Tasks: %v\n", stats["running_tasks"])
-fmt.Printf("Total Runs: %v\n", stats["total_runs"])
-fmt.Printf("Total Errors: %v\n", stats["total_errors"])
-fmt.Printf("Max Concurrent: %v\n", stats["max_concurrent"])
-fmt.Printf("Allow Overlapping: %v\n", stats["allow_overlapping"])
+stats := tm.Stats()
+fmt.Printf("Total Tasks: %d\n", stats.TotalTasks)
+fmt.Printf("Enabled Tasks: %d\n", stats.EnabledTasks)
+fmt.Printf("Running Tasks: %d\n", stats.RunningTasks)
+fmt.Printf("Total Runs: %d\n", stats.TotalRuns)
+fmt.Printf("Total Errors: %d\n", stats.TotalErrors)
+fmt.Printf("Max Concurrent: %d\n", stats.MaxConcurrent)
+fmt.Printf("Allow Overlapping: %v\n", stats.AllowOverlapping)
 ```
 
 ## Working with Context
@@ -355,8 +450,10 @@ tm.AddTask("example", mita.Every().Minute(), func(ctx context.Context) error {
 tm.AddTask("example", mita.Every().Minute(), func(ctx context.Context) error {
     // Get injected static context values
     db := mita.ContextValue(ctx, "database").(*sql.DB)
-    requestID := ctx.Value("request_id").(string)
     env := mita.ContextValue(ctx, "env").(string)
+    
+    // Values added by your own WithContextInjector use your own key type
+    requestID := ctx.Value(requestIDKey{}).(string)
     
     // Use injected values
     log.Printf("[%s] Processing in %s environment", requestID, env)
@@ -365,6 +462,10 @@ tm.AddTask("example", mita.Every().Minute(), func(ctx context.Context) error {
     return nil
 })
 ```
+
+Values injected with `WithContextValue`/`SetContextValue` live under a private
+key type, so they can never collide with the internal task name key or with
+keys used by other libraries — always read them back with `mita.ContextValue`.
 
 ### Handling Context Cancellation
 
@@ -436,33 +537,54 @@ if taskInfo.LastError != "" {
 
 ## Graceful Shutdown
 
-The task manager supports graceful shutdown with proper cleanup:
+The task manager shuts down in two phases: first it waits for running tasks to
+finish naturally, and only when the deadline expires does it cancel their
+contexts. Tasks that respect `ctx.Done()` are therefore never interrupted as
+long as they finish within the timeout.
 
 ```go
 func main() {
-    tm := mita.New()
+    tm := mita.New(mita.WithShutdownTimeout(15 * time.Second))
     // ... add tasks
-    tm.Start()
+    if err := tm.Start(); err != nil {
+        log.Fatal(err)
+    }
     
     // Listen for system signals
     sigChan := make(chan os.Signal, 1)
     signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
     <-sigChan
     
-    // Gracefully shutdown (waits up to 30 seconds for running tasks)
-    tm.Stop()
+    // Gracefully shutdown
+    if err := tm.Stop(); err != nil {
+        log.Printf("shutdown: %v", err)
+    }
 }
 ```
 
 The `Stop()` method:
-1. Cancels the manager context (stops new executions)
-2. Stops the cron scheduler
-3. Waits for all running tasks to complete (up to 30 seconds)
-4. Logs completion status
+1. Stops the cron scheduler and rejects new executions
+2. Waits for all running tasks to complete, up to the shutdown timeout
+   (`WithShutdownTimeout`, default 30 seconds)
+3. If the deadline expires, cancels the task contexts and waits a short grace
+   period for tasks to exit
+4. Returns `nil` on a clean shutdown, or an error wrapping
+   `context.DeadlineExceeded` if tasks had to be canceled
 
-`Start()` and `Stop()` are idempotent. `Stop()` is terminal: after it is called,
-the manager cannot be restarted and new tasks or manual executions are rejected
-with `ErrTaskManagerStopped`.
+Use `StopContext(ctx)` to control the deadline with your own context — handy
+when coordinating with an HTTP server shutdown:
+
+```go
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+defer cancel()
+_ = server.Shutdown(shutdownCtx)
+_ = tm.StopContext(shutdownCtx)
+```
+
+`Stop()` is terminal: after it is called, the manager cannot be restarted and
+new tasks or manual executions are rejected with `ErrTaskManagerStopped`.
+Calling `Start()` twice returns `ErrTaskManagerStarted`; calling `Stop()` twice
+returns `ErrTaskManagerStopped`. Use `IsStarted()` to query the state.
 
 ## Web Management Interface
 
@@ -643,8 +765,11 @@ tm := mita.New(mita.WithAllowOverlapping(false))
 ticker := time.NewTicker(5 * time.Minute)
 go func() {
     for range ticker.C {
-        stats := tm.GetStats()
-        errorRate := float64(stats["total_errors"].(int64)) / float64(stats["total_runs"].(int64))
+        stats := tm.Stats()
+        if stats.TotalRuns == 0 {
+            continue
+        }
+        errorRate := float64(stats.TotalErrors) / float64(stats.TotalRuns)
         if errorRate > 0.1 { // More than 10% errors
             alert("High task error rate detected")
         }
@@ -652,17 +777,19 @@ go func() {
 }()
 ```
 
+Or push-based, using the hooks: `WithOnTaskComplete` for failures and
+`WithOnTaskSkip` for executions rejected by overlap/concurrency rules.
+
 ### 6. Use Timeouts for External Calls
+
+Prefer the per-task option so the timeout also shows up in error statistics:
 
 ```go
 tm.AddTask("api-call", schedule, func(ctx context.Context) error {
-    ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-    defer cancel()
-    
     req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
     resp, err := client.Do(req)
     // ...
-})
+}, mita.WithTaskTimeout(30*time.Second))
 ```
 
 ### 7. Clean Up Resources
@@ -693,29 +820,40 @@ All mita methods are thread-safe and can be called concurrently:
 go tm.AddTask(name1, schedule1, task1)
 go tm.AddTask(name2, schedule2, task2)
 go tm.RunTaskNow(name1)
-go tm.GetStats()
+go tm.Stats()
 ```
 
-## Limitations
+## Scope & Limitations
 
-- Maximum timeout for graceful shutdown: 30 seconds
-- Task names must be unique
-- Cron expressions use 6 fields (seconds supported)
+mita is deliberately a *minimum* scheduling library. Out of scope (by design):
+
+- **Retry/backoff policies** — wrap your task function if you need retries
+- **Persistence** — schedules and statistics live in memory only
+- **Distributed coordination** — for multi-instance deployments, add your own
+  distributed lock inside the task
+
+Other limitations:
+
+- Task names must be unique (`ErrTaskExists` otherwise)
+- A stopped manager cannot be restarted; create a new one
 - Context values are copied, not referenced (use pointers for shared state)
 
 ## FAQ
 
 **Q: Can I update a task's schedule without removing it?**  
-A: Currently, you need to remove and re-add the task. A future version may support schedule updates.
+A: Yes — `tm.UpdateSchedule(name, schedule)` swaps the schedule in place and preserves statistics.
 
 **Q: What happens if a task is already running when triggered manually?**  
-A: If `AllowOverlapping` is false, you'll get an error. If true, both instances will run.
+A: If overlapping is not allowed (manager default, or per-task `WithTaskOverlapping(false)`), you'll get `ErrTaskRunning`. If allowed, both instances run.
+
+**Q: Can I manually run a disabled task?**  
+A: Yes. Disabling only pauses the schedule; `RunTaskNow` and `RunTaskNowAndWait` are explicit requests and always work.
 
 **Q: How do I handle tasks that might run longer than their interval?**  
-A: Set `WithAllowOverlapping(false)` to skip executions if the previous one is still running.
+A: Keep overlapping disabled to skip executions while the previous one is still running, and consider `WithTaskTimeout` to bound each execution. Use `WithOnTaskSkip` to observe the skips.
 
 **Q: Can I pause the entire task manager?**  
-A: Not directly. You can disable all tasks individually or stop and restart the manager.
+A: Not directly. You can disable all tasks individually. Note a stopped manager cannot be restarted.
 
 **Q: Is it safe to modify context values during execution?**  
 A: Use `SetContextValue()` to update values. Changes apply to new executions, not running ones.
@@ -728,27 +866,49 @@ A: The web interface has no built-in authentication. Always add authentication m
 
 ## Testing
 
-To test your tasks:
+To test your tasks deterministically, trigger them manually instead of waiting
+for the schedule:
 
 ```go
 func TestMyTask(t *testing.T) {
     tm := mita.New()
-    
-    executed := false
-    tm.AddTask("test", mita.Every().Second(), func(ctx context.Context) error {
-        executed = true
+    defer tm.Stop()
+
+    var executed atomic.Bool
+    if err := tm.AddTask("test", mita.Every().Minute(), func(ctx context.Context) error {
+        executed.Store(true)
         return nil
-    })
-    
-    tm.Start()
-    time.Sleep(2 * time.Second)
-    tm.Stop()
-    
-    if !executed {
+    }); err != nil {
+        t.Fatal(err)
+    }
+
+    if err := tm.RunTaskNowAndWait(context.Background(), "test"); err != nil {
+        t.Fatal(err)
+    }
+    if !executed.Load() {
         t.Error("Task was not executed")
     }
 }
 ```
+
+## Migrating from v0.x
+
+Breaking changes in this version:
+
+| Before | After |
+|---|---|
+| `tm.GetStats()` returns `map[string]interface{}` | `tm.Stats()` returns a typed `Stats` struct |
+| `tm.RunTaskNow(name) error` | `tm.RunTaskNow(name) (<-chan error, error)` — the channel carries the task result and can be ignored |
+| `tm.GetTask` returns `*TaskInfo` | returns a `TaskInfo` value snapshot |
+| `TaskInfo.Running` field | `TaskInfo.Running()` method; `Task` and `EntryID` fields removed |
+| `tm.IsRunning()` | `tm.IsStarted()` |
+| `tm.Start()` / `tm.Stop()` return nothing | both return `error`; `StopContext(ctx)` added |
+| `Stop()` cancels task contexts immediately | two-phase: waits first, cancels after the shutdown timeout |
+| `ScheduleBuilder` panics on invalid input | records the error; surfaced by `builder.Err()` and `AddTask` |
+| `Every().Seconds(90)` accepted (misfired every 60s) | rejected; use `Every().Interval(90 * time.Second)` |
+| `CtxtKey` exported key type | removed; use `mita.ContextValue(ctx, key)` to read injected values |
+| `RunTaskNow` on a disabled task returns `ErrTaskDisabled` | manual triggers are allowed on disabled tasks |
+| duplicate `AddTask` returns a plain error | returns `ErrTaskExists` (checkable with `errors.Is`) |
 
 ## License
 
