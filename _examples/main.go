@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cymoo/mita"
@@ -28,10 +31,14 @@ func main() {
 		mita.WithLocation(location),
 		mita.WithMaxConcurrent(3),        // Max 3 concurrent running tasks
 		mita.WithAllowOverlapping(false), // Prevent overlapping executions
+		mita.WithShutdownTimeout(10*time.Second),
 		mita.WithContextValue("app", "demo"),
 		mita.WithContextInjector(func(ctx context.Context, taskName string) context.Context {
-			// Dynamically inject request ID
-			return context.WithValue(ctx, "request_id", fmt.Sprintf("%s-%d", taskName, time.Now().Unix()))
+			// Dynamically inject a request ID under your own key type
+			return context.WithValue(ctx, requestIDKey{}, fmt.Sprintf("%s-%d", taskName, time.Now().Unix()))
+		}),
+		mita.WithOnTaskSkip(func(e mita.TaskSkipEvent) {
+			fmt.Printf("⏭  %s skipped (%s): %v\n", e.TaskName, e.Trigger, e.Reason)
 		}),
 	)
 
@@ -39,7 +46,7 @@ func main() {
 	err = tm.AddTask("cleanup", mita.Every().Seconds(5), func(ctx context.Context) error {
 		taskName := mita.GetTaskName(ctx)
 		app := mita.ContextValue(ctx, "app")
-		requestID := ctx.Value("request_id")
+		requestID := ctx.Value(requestIDKey{})
 
 		fmt.Printf("[%s] Starting data cleanup... (app=%v, request_id=%v)\n", taskName, app, requestID)
 		time.Sleep(2 * time.Second) // Simulate work
@@ -50,8 +57,8 @@ func main() {
 		log.Fatalf("Failed to add cleanup task: %v", err)
 	}
 
-	// Example 2: Data sync task - runs every 10 seconds (may fail)
-	err = tm.AddTask("sync", mita.Every().Seconds(10), func(ctx context.Context) error {
+	// Example 2: Data sync task - fixed 10-second interval (may fail)
+	err = tm.AddTask("sync", mita.Every().Interval(10*time.Second), func(ctx context.Context) error {
 		taskName := mita.GetTaskName(ctx)
 		fmt.Printf("[%s] Starting data synchronization...\n", taskName)
 
@@ -98,8 +105,8 @@ func main() {
 		log.Fatalf("Failed to add backup task: %v", err)
 	}
 
-	// Example 5: Health check using raw cron expression - every 15 minutes
-	err = tm.AddTask("health-check", mita.Cron("0 */15 * * * *"), func(ctx context.Context) error {
+	// Example 5: Health check using a standard 5-field cron expression - every 15 minutes
+	err = tm.AddTask("health-check", mita.Cron("*/15 * * * *"), func(ctx context.Context) error {
 		taskName := mita.GetTaskName(ctx)
 		fmt.Printf("[%s] Performing health check...\n", taskName)
 		time.Sleep(500 * time.Millisecond)
@@ -110,7 +117,7 @@ func main() {
 		log.Fatalf("Failed to add health check task: %v", err)
 	}
 
-	// Example 6: Long-running task with context cancellation handling
+	// Example 6: Long-running task with a per-task timeout
 	err = tm.AddTask("long-task", mita.Every().Minutes(2), func(ctx context.Context) error {
 		taskName := mita.GetTaskName(ctx)
 		fmt.Printf("[%s] Starting long-running task...\n", taskName)
@@ -129,25 +136,32 @@ func main() {
 
 		fmt.Printf("[%s] Long task completed\n", taskName)
 		return nil
-	})
+	}, mita.WithTaskTimeout(30*time.Second))
 	if err != nil {
 		log.Fatalf("Failed to add long-running task: %v", err)
 	}
 
 	// Start the task manager
-	tm.Start()
+	if err := tm.Start(); err != nil {
+		log.Fatalf("Failed to start task manager: %v", err)
+	}
 	fmt.Println("\n✓ Task manager started. Press Ctrl+C to stop...")
 	fmt.Println(strings.Repeat("=", 70))
 
-	// Create web handler mounted at /
+	// Create web handler mounted at /tasks
 	mux := tm.WebHandler("/tasks")
 
-	// Manually trigger sync task after 3 seconds
+	// Manually trigger sync task after 3 seconds and wait for its result
 	go func() {
 		time.Sleep(3 * time.Second)
 		fmt.Println("\n>>> Manually triggering sync task <<<")
-		if err := tm.RunTaskNow("sync"); err != nil {
+		done, err := tm.RunTaskNow("sync")
+		if err != nil {
 			log.Printf("Manual trigger failed: %v", err)
+			return
+		}
+		if err := <-done; err != nil {
+			log.Printf("Manual sync run finished with error: %v", err)
 		}
 	}()
 
@@ -167,6 +181,12 @@ func main() {
 		fmt.Println("\n>>> Re-enabling cleanup task <<<")
 		if err := tm.EnableTask("cleanup"); err != nil {
 			log.Printf("Failed to enable task: %v", err)
+		}
+
+		// Reschedule the report task without losing its statistics
+		fmt.Println("\n>>> Rescheduling report task to every 30 seconds <<<")
+		if err := tm.UpdateSchedule("report", mita.Every().Seconds(30)); err != nil {
+			log.Printf("Failed to update schedule: %v", err)
 		}
 	}()
 
@@ -192,12 +212,31 @@ func main() {
 	}()
 
 	// Start HTTP server
-	log.Printf("server starting on http://localhost:8080/tasks")
-	fmt.Println(strings.Repeat("=", 70))
-	if err := http.ListenAndServe("localhost:8080", mux); err != nil {
-		log.Fatalf("server failed: %v", err)
+	server := &http.Server{Addr: "localhost:8080", Handler: mux}
+	go func() {
+		log.Printf("server starting on http://localhost:8080/tasks")
+		fmt.Println(strings.Repeat("=", 70))
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server failed: %v", err)
+		}
+	}()
+
+	// Graceful shutdown on Ctrl+C: stop the HTTP server, then drain tasks.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+
+	fmt.Println("\n>>> Shutting down <<<")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = server.Shutdown(shutdownCtx)
+	if err := tm.StopContext(shutdownCtx); err != nil {
+		log.Printf("Task manager stopped with error: %v", err)
 	}
 }
+
+// requestIDKey is a private context key type for the injected request ID.
+type requestIDKey struct{}
 
 // displayStats shows current task manager statistics
 func displayStats(tm *mita.TaskManager) {
@@ -205,14 +244,14 @@ func displayStats(tm *mita.TaskManager) {
 	fmt.Println("TASK MANAGER STATISTICS")
 	fmt.Println(strings.Repeat("=", 70))
 
-	stats := tm.GetStats()
-	fmt.Printf("Total Tasks:       %v\n", stats["total_tasks"])
-	fmt.Printf("Enabled Tasks:     %v\n", stats["enabled_tasks"])
-	fmt.Printf("Running Tasks:     %v\n", stats["running_tasks"])
-	fmt.Printf("Total Executions:  %v\n", stats["total_runs"])
-	fmt.Printf("Total Errors:      %v\n", stats["total_errors"])
-	fmt.Printf("Max Concurrent:    %v\n", stats["max_concurrent"])
-	fmt.Printf("Allow Overlapping: %v\n", stats["allow_overlapping"])
+	stats := tm.Stats()
+	fmt.Printf("Total Tasks:       %d\n", stats.TotalTasks)
+	fmt.Printf("Enabled Tasks:     %d\n", stats.EnabledTasks)
+	fmt.Printf("Running Tasks:     %d\n", stats.RunningTasks)
+	fmt.Printf("Total Executions:  %d\n", stats.TotalRuns)
+	fmt.Printf("Total Errors:      %d\n", stats.TotalErrors)
+	fmt.Printf("Max Concurrent:    %d\n", stats.MaxConcurrent)
+	fmt.Printf("Allow Overlapping: %v\n", stats.AllowOverlapping)
 
 	fmt.Println("\nPER-TASK DETAILS")
 	fmt.Println(strings.Repeat("=", 70))
@@ -221,7 +260,7 @@ func displayStats(tm *mita.TaskManager) {
 	for _, task := range tasks {
 		fmt.Printf("\n📌 Task: %s\n", task.Name)
 		fmt.Printf("   Schedule:     %s\n", task.Schedule)
-		fmt.Printf("   Status:       Enabled=%v, Running=%v\n", task.Enabled, task.Running)
+		fmt.Printf("   Status:       Enabled=%v, Running=%v\n", task.Enabled, task.Running())
 		fmt.Printf("   Executions:   %d (Errors: %d)\n", task.RunCount, task.ErrorCount)
 		fmt.Printf("   Added At:     %s\n", task.AddedAt.Format("2006-01-02 15:04:05"))
 
