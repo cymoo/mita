@@ -21,7 +21,7 @@
     <div class="top-spacer"></div>
     <span class="pill" id="pill"><span class="pd"></span><span id="pill-text">Connecting…</span></span>
     <span class="top-clock num" id="clock"></span>
-    <button class="iconbtn" id="theme-btn" title="Toggle theme"></button>
+    <button class="iconbtn" id="theme-btn" type="button" title="Toggle theme" aria-label="Toggle theme"></button>
   </div>
 
   <div class="overview" id="overview"></div>
@@ -306,7 +306,16 @@
     acts.appendChild(btnRun); acts.appendChild(btnPause);
     root.appendChild(acts);
 
+    root.tabIndex = 0;
+    root.setAttribute("role", "button");
+    root.setAttribute("aria-label", name + " — task details");
     root.addEventListener("click", function () { selName === name ? closeDrawer() : openDrawer(name); });
+    root.addEventListener("keydown", function (e) {
+      if (e.target === root && (e.key === "Enter" || e.key === " ")) {
+        e.preventDefault();
+        selName === name ? closeDrawer() : openDrawer(name);
+      }
+    });
     acts.addEventListener("click", function (e) { e.stopPropagation(); });
     btnRun.addEventListener("click", function () { doRun(name); });
     btnPause.addEventListener("click", function () { doTogglePause(name); });
