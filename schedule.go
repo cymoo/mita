@@ -57,7 +57,43 @@ func scheduleExpr(schedule Schedule) (string, error) {
 			return "", fmt.Errorf("invalid schedule: %w", err)
 		}
 	}
-	return normalizeCronExpr(schedule.String()), nil
+	expr := normalizeCronExpr(schedule.String())
+	if err := validateCronSteps(expr); err != nil {
+		return "", fmt.Errorf("invalid schedule: %w", err)
+	}
+	return expr, nil
+}
+
+// validateCronSteps rejects step values that exceed their field's range.
+// The cron parser accepts them silently, but a step beyond the range fires
+// only at the field's start: "*/90" in the seconds field runs every 60s,
+// not every 90s. Other syntax errors are left for the parser to report.
+func validateCronSteps(expr string) error {
+	if strings.HasPrefix(expr, "@") {
+		return nil
+	}
+	fields := strings.Fields(expr)
+	if len(fields) != 6 {
+		return nil
+	}
+	maxSteps := [6]int{59, 59, 23, 31, 12, 7}
+	names := [6]string{"seconds", "minutes", "hours", "day-of-month", "month", "day-of-week"}
+	for i, field := range fields {
+		for _, part := range strings.Split(field, ",") {
+			slash := strings.Index(part, "/")
+			if slash < 0 {
+				continue
+			}
+			step, err := strconv.Atoi(part[slash+1:])
+			if err != nil {
+				continue
+			}
+			if step < 1 || step > maxSteps[i] {
+				return fmt.Errorf("%s step must be 1-%d, got %d (use @every for longer periods)", names[i], maxSteps[i], step)
+			}
+		}
+	}
+	return nil
 }
 
 // ScheduleBuilder provides a fluent API for building cron schedules.
