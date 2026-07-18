@@ -1,3 +1,9 @@
 .idea
 .vscode
 .DS_Store
+
+# Local agent/tooling config
+.claude/
+
+# Design prototypes and screenshots (not part of the library)
+designs/
